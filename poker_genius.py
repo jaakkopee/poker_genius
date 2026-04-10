@@ -364,6 +364,9 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             suit = suit_ocr
         else:
             suit = suit_match
+        
+        # Debug output
+        print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}")
 
         if rank and suit:
             score = rank_score + suit_score
@@ -1203,13 +1206,13 @@ class PokerGeniusApp(tk.Tk):
             if mode == 'move':
                 canvas.config(cursor='fleur')
             elif mode in ('nw', 'se'):
-                canvas.config(cursor='size_nw_se')
+                canvas.config(cursor='sizing')
             elif mode in ('ne', 'sw'):
-                canvas.config(cursor='size_ne_sw')
+                canvas.config(cursor='sizing')
             elif mode in ('n', 's'):
-                canvas.config(cursor='size_ns')
+                canvas.config(cursor='sb_v_double_arrow')
             elif mode in ('w', 'e'):
-                canvas.config(cursor='size_ew')
+                canvas.config(cursor='sb_h_double_arrow')
             else:
                 canvas.config(cursor='arrow')
         
