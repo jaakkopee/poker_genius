@@ -38,8 +38,10 @@ SUIT_ALIASES = {
 }
 
 RANK_VALUES = {r: i for i, r in enumerate(RANKS)}
-OCR_ROTATION_ANGLES = (-15, -10, -5, 0, 5, 10, 15)
+OCR_ROTATION_ANGLES = (-5, 0, 5)
 OCR_CONFIG = "--psm 11"
+CARD_ORIENTATIONS = (0, 180)
+TEMPLATE_CONFIDENCE_THRESHOLD = 0.50
 CARD_CANVAS = (180, 252)
 SYMBOL_TEMPLATE_SIZE = (64, 64)
 CARD_MASK_LOW = np.array([0, 0, 140], dtype=np.uint8)
@@ -72,7 +74,7 @@ def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
     processed = Image.fromarray(cv2.medianBlur(thresholded, 3))
     processed = processed.filter(ImageFilter.SHARPEN)
     processed = ImageEnhance.Contrast(processed).enhance(2.0)
-    return processed.resize((processed.width * 3, processed.height * 3), Image.LANCZOS)
+    return processed.resize((processed.width * 2, processed.height * 2), Image.LANCZOS)
 
 
 def order_points(points: np.ndarray) -> np.ndarray:
@@ -327,7 +329,7 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
     best_score = 0.0
     best_debug = ""
 
-    for orientation in (0, 90, 180, 270):
+    for orientation in CARD_ORIENTATIONS:
         oriented = rotate_for_ocr(card_image, orientation)
         if oriented.width > oriented.height:
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
@@ -338,14 +340,20 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         suit_crop = corner.crop((0, int(corner.height * 0.38), int(corner.width * 0.68), int(corner.height * 0.95)))
 
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates())
-        rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
+        # Skip OCR if template matching is confident
+        rank_ocr = None
+        if rank_score < TEMPLATE_CONFIDENCE_THRESHOLD:
+            rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         rank = rank_match
         if rank_ocr and (rank_ocr == rank_match or rank_score < 0.38):
             rank = rank_ocr
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
-        suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
+        # Skip OCR if template matching is confident
+        suit_ocr = None
+        if suit_score < TEMPLATE_CONFIDENCE_THRESHOLD:
+            suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
         suit = suit_match
         if suit_ocr and suit_ocr in allowed_suits and (suit_ocr == suit_match or suit_score < 0.28):
             suit = suit_ocr
@@ -359,6 +367,9 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
                     f"orientation={orientation} rank={rank}({rank_score:.2f}/{rank_ocr or '-'}) "
                     f"suit={suit}({suit_score:.2f}/{suit_ocr or '-'})"
                 )
+                # Early exit if we have high confidence
+                if score > 1.5:
+                    break
 
     return best_card, best_score, best_debug
 
@@ -393,6 +404,14 @@ def ocr_cards_from_image(pil_image: Image.Image) -> Tuple[str, List[str]]:
     """Use region detection first, then multi-angle OCR as a fallback and supplement."""
     region_cards, region_debug = detect_cards_by_regions(pil_image)
     all_cards = list(region_cards)
+    
+    # Skip expensive full-image OCR if region detection found enough cards
+    if len(region_cards) >= 2:
+        preview_lines = [f"Region detector found: {', '.join(region_cards)}"]
+        preview_lines.extend(region_debug[:8])
+        preview_lines.append("Skipped full-image OCR (sufficient cards from regions)")
+        return "\n".join(preview_lines), region_cards
+    
     best_cards: List[str] = []
     best_text = ""
     best_angle = 0
