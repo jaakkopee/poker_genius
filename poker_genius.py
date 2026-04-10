@@ -1081,19 +1081,31 @@ class PokerGeniusApp(tk.Tk):
         overlay.attributes('-topmost', True)
         overlay.configure(bg='black')
         
+        # Get logical screen dimensions
+        screen_w = overlay.winfo_screenwidth()
+        screen_h = overlay.winfo_screenheight()
+        
+        # Calculate scale factor for HiDPI displays (Retina, etc.)
+        scale_x = screenshot.width / screen_w
+        scale_y = screenshot.height / screen_h
+        
+        # Scale screenshot to match logical screen size
+        if screenshot.width != screen_w or screenshot.height != screen_h:
+            screenshot_display = screenshot.resize((screen_w, screen_h), Image.LANCZOS)
+        else:
+            screenshot_display = screenshot
+        
         # Canvas for drawing
-        canvas = tk.Canvas(overlay, highlightthickness=0)
+        canvas = tk.Canvas(overlay, highlightthickness=0, width=screen_w, height=screen_h)
         canvas.pack(fill=tk.BOTH, expand=True)
         
         # Display screenshot as background
         from PIL import ImageTk
-        photo = ImageTk.PhotoImage(screenshot)
+        photo = ImageTk.PhotoImage(screenshot_display)
         canvas.create_image(0, 0, image=photo, anchor=tk.NW)
         canvas.image = photo  # Keep reference
         
         # Initial rectangle (center of screen)
-        screen_w = overlay.winfo_screenwidth()
-        screen_h = overlay.winfo_screenheight()
         rect_w, rect_h = 800, 600
         rect_x1 = (screen_w - rect_w) // 2
         rect_y1 = (screen_h - rect_h) // 2
@@ -1205,17 +1217,17 @@ class PokerGeniusApp(tk.Tk):
             coords = canvas.coords(rect)
             if coords:
                 x1, y1, x2, y2 = coords
-                # Ensure proper ordering
+                # Scale coordinates back to native resolution for actual capture
                 self.capture_bbox = (
-                    int(min(x1, x2)),
-                    int(min(y1, y2)),
-                    int(max(x1, x2)),
-                    int(max(y1, y2))
+                    int(min(x1, x2) * scale_x),
+                    int(min(y1, y2) * scale_y),
+                    int(max(x1, x2) * scale_x),
+                    int(max(y1, y2) * scale_y)
                 )
-                w = self.capture_bbox[2] - self.capture_bbox[0]
-                h = self.capture_bbox[3] - self.capture_bbox[1]
+                w = int((max(x1, x2) - min(x1, x2)) * scale_x)
+                h = int((max(y1, y2) - min(y1, y2)) * scale_y)
                 self.board_area_btn.config(text=f"Board Area: {w}x{h}")
-                self._set_status(f"Board area set: {w}x{h} pixels")
+                self._set_status(f"Board area set: {w}x{h} pixels (native resolution)")
             overlay.destroy()
             self.deiconify()
         
