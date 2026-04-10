@@ -359,9 +359,11 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
         oriented = oriented.resize(CARD_CANVAS, Image.LANCZOS)
 
-        corner = oriented.crop((0, 0, int(oriented.width * 0.36), int(oriented.height * 0.31)))
-        rank_crop = corner.crop((0, 0, int(corner.width * 0.58), int(corner.height * 0.52)))
-        suit_crop = corner.crop((0, int(corner.height * 0.38), int(corner.width * 0.68), int(corner.height * 0.95)))
+        # Extract larger corner area to avoid cutting off symbols  
+        corner = oriented.crop((0, 0, int(oriented.width * 0.45), int(oriented.height * 0.38)))
+        # Extract rank and suit with more generous margins
+        rank_crop = corner.crop((0, 0, int(corner.width * 0.75), int(corner.height * 0.55)))
+        suit_crop = corner.crop((0, int(corner.height * 0.32), int(corner.width * 0.85), corner.height))
         
         # DEBUG: Save crops for inspection
         import os
@@ -375,19 +377,20 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         
-        # Choose best rank: always prefer template match if it exists, unless OCR has very strong agreement
+        # Choose best rank: balance template matching and OCR based on confidence
         if rank_match and rank_ocr and rank_match == rank_ocr:
             rank = rank_match  # Both agree - definitely correct
         elif rank_match and rank_score >= rank_threshold:
-            rank = rank_match  # Template is confident
-        elif rank_match and not rank_ocr:
-            rank = rank_match  # OCR failed, use template
-        elif rank_match and rank_score >= 0.15:
-            rank = rank_match  # Template has some confidence, OCR often wrong
-        elif rank_ocr:
-            rank = rank_ocr  # Last resort: use OCR
+            rank = rank_match  # Template is confident enough
+        elif rank_ocr and (not rank_match or rank_score < 0.25):
+            rank = rank_ocr  # OCR has result and template is weak/missing
+        elif rank_ocr and rank_match and rank_score < 0.35:
+            # Template has low-medium confidence but OCR disagrees - trust OCR
+            rank = rank_ocr
+        elif rank_match:
+            rank = rank_match  # Use template (OCR failed or template more reliable)
         else:
-            rank = rank_match  # Ultimate fallback
+            rank = rank_ocr  # Last resort OCR
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits, debug_label=f"SUIT@{orientation}° allowed={allowed_suits}")
