@@ -168,7 +168,7 @@ def get_suit_templates() -> dict:
     }
 
 
-def template_match_symbol(pil_image: Image.Image, templates: dict, allowed: Optional[set] = None) -> Tuple[Optional[str], float]:
+def template_match_symbol(pil_image: Image.Image, templates: dict, allowed: Optional[set] = None, debug_label: str = "") -> Tuple[Optional[str], float]:
     """Return the best matching canonical symbol and its normalized correlation score."""
     normalized = normalize_symbol_patch(pil_image)
     if normalized is None:
@@ -176,15 +176,27 @@ def template_match_symbol(pil_image: Image.Image, templates: dict, allowed: Opti
 
     best_symbol = None
     best_score = 0.0
+    all_scores = {}  # Track all symbol scores for debugging
     candidate = normalized.astype(np.float32)
     for symbol, variants in templates.items():
         if allowed and symbol not in allowed:
             continue
+        max_score_for_symbol = 0.0
         for template in variants:
             score = float(cv2.matchTemplate(candidate, template.astype(np.float32), cv2.TM_CCOEFF_NORMED)[0][0])
-            if score > best_score:
-                best_symbol = symbol
-                best_score = score
+            if score > max_score_for_symbol:
+                max_score_for_symbol = score
+        all_scores[symbol] = max_score_for_symbol
+        if max_score_for_symbol > best_score:
+            best_symbol = symbol
+            best_score = max_score_for_symbol
+    
+    # Debug: show top 3 matches
+    if debug_label and all_scores:
+        sorted_scores = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        debug_str = " | ".join([f"{sym}:{sc:.3f}" for sym, sc in sorted_scores])
+        import sys
+        print(f"    [{debug_label}] {debug_str}", file=sys.stderr, flush=True)
 
     return best_symbol, best_score
 
@@ -350,8 +362,17 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         corner = oriented.crop((0, 0, int(oriented.width * 0.36), int(oriented.height * 0.31)))
         rank_crop = corner.crop((0, 0, int(corner.width * 0.58), int(corner.height * 0.52)))
         suit_crop = corner.crop((0, int(corner.height * 0.38), int(corner.width * 0.68), int(corner.height * 0.95)))
+        
+        # DEBUG: Save crops for inspection
+        import os
+        import sys
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
+        os.makedirs(debug_dir, exist_ok=True)
+        rank_crop.save(f"{debug_dir}/rank_{orientation}.png")
+        suit_crop.save(f"{debug_dir}/suit_{orientation}.png")
+        print(f"  Saved debug crops to {debug_dir}/rank_{orientation}.png", file=sys.stderr, flush=True)
 
-        rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates())
+        rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         
         # Choose best rank: always prefer template match if it exists, unless OCR has very strong agreement
@@ -369,7 +390,7 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             rank = rank_match  # Ultimate fallback
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
-        suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
+        suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits, debug_label=f"SUIT@{orientation}° allowed={allowed_suits}")
         suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
         
         # Choose best suit: prefer template match over OCR generally
@@ -387,7 +408,8 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             suit = suit_ocr  # Last resort
         
         # Debug output
-        print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}")
+        import sys
+        print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}", file=sys.stderr, flush=True)
 
         if rank and suit:
             score = rank_score + suit_score
