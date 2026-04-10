@@ -936,10 +936,6 @@ class PokerGeniusApp(tk.Tk):
 
         hole  = cards[:2]
         board = cards[2:7]
-        
-        # Pre-flop uses only hole cards for equity simulation
-        if street == "Pre-Flop":
-            board = []
 
         street_sel = self.street_var.get()
         if street_sel == "Auto-detect":
@@ -948,6 +944,10 @@ class PokerGeniusApp(tk.Tk):
                       "Turn"     if len(board) == 4 else "River")
         else:
             street = street_sel
+        
+        # Pre-flop uses only hole cards for equity simulation
+        if street == "Pre-Flop":
+            board = []
 
         position = self.position_var.get()
         num_opp  = self.opponents_var.get()
