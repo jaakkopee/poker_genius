@@ -13,12 +13,21 @@ echo "║        Poker Genius – macOS Setup        ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# ── 1. Check Python 3 ──────────────────────────────────
+# ── 1. Resolve Python 3 ────────────────────────────────
 echo "→ Checking for Python 3…"
-if command -v python3 &>/dev/null; then
-    PY_VERSION=$(python3 --version 2>&1)
-    echo "  Found: $PY_VERSION"
-else
+PYTHON_BIN=""
+if command -v brew &>/dev/null; then
+    BREW_PREFIX="$(brew --prefix)"
+    if [[ -x "$BREW_PREFIX/bin/python3" ]]; then
+        PYTHON_BIN="$BREW_PREFIX/bin/python3"
+    fi
+fi
+
+if [[ -z "$PYTHON_BIN" ]] && command -v python3 &>/dev/null; then
+    PYTHON_BIN="$(command -v python3)"
+fi
+
+if [[ -z "$PYTHON_BIN" ]]; then
     echo ""
     echo "  ERROR: python3 not found."
     echo "  Install Python 3 from https://www.python.org/downloads/"
@@ -26,9 +35,12 @@ else
     exit 1
 fi
 
+PY_VERSION="$($PYTHON_BIN --version 2>&1)"
+echo "  Using: $PY_VERSION ($PYTHON_BIN)"
+
 # Require Python >= 3.8
-PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
-PY_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
+PY_MINOR="$($PYTHON_BIN -c "import sys; print(sys.version_info.minor)")"
+PY_MAJOR="$($PYTHON_BIN -c "import sys; print(sys.version_info.major)")"
 if [[ "$PY_MAJOR" -lt 3 || ( "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 8 ) ]]; then
     echo "  ERROR: Python 3.8+ is required (found $PY_VERSION)."
     exit 1
@@ -57,43 +69,65 @@ else
     fi
 fi
 
-# ── 3. Create virtual environment ─────────────────────
+# ── 3. Ensure Homebrew Python/Tk on macOS when available ─────────────
+if command -v brew &>/dev/null; then
+    echo ""
+    echo "→ Ensuring Homebrew Python/Tk packages are installed…"
+    brew install python tcl-tk python-tk@3.14
+    BREW_PREFIX="$(brew --prefix)"
+    if [[ -x "$BREW_PREFIX/bin/python3" ]]; then
+        PYTHON_BIN="$BREW_PREFIX/bin/python3"
+        PY_VERSION="$($PYTHON_BIN --version 2>&1)"
+        echo "  Using Homebrew Python: $PY_VERSION ($PYTHON_BIN)"
+    fi
+fi
+
+# ── 4. Create virtual environment ─────────────────────
 echo ""
 echo "→ Creating virtual environment at .venv…"
 if [[ -d "$VENV_DIR" ]]; then
     echo "  .venv already exists, skipping creation."
 else
-    python3 -m venv "$VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
     echo "  Created."
 fi
 
-# ── 4. Upgrade pip ────────────────────────────────────
+# ── 5. Upgrade pip ────────────────────────────────────
 echo ""
 echo "→ Upgrading pip…"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 
-# ── 5. Install requirements ───────────────────────────
+# ── 6. Install requirements ───────────────────────────
 echo ""
 echo "→ Installing Python dependencies from requirements.txt…"
 "$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
 echo "  Done."
 
-# ── 6. Verify tkinter ────────────────────────────────
+# ── 7. Verify tkinter ────────────────────────────────
 echo ""
 echo "→ Verifying tkinter availability…"
 if "$VENV_DIR/bin/python" -c "import tkinter" 2>/dev/null; then
     echo "  tkinter: OK"
+    echo "  Tk version: $("$VENV_DIR/bin/python" -c "import tkinter as tk; root = tk.Tk(); print(root.tk.call('info', 'patchlevel')); root.destroy()")"
 else
     echo "  WARNING: tkinter not available in this Python build."
     echo "  On macOS you can install a tkinter-enabled Python via:"
-    echo "    brew install python-tk"
+    echo "    brew install python python-tk@3.14 tcl-tk"
 fi
 
-# ── 7. Create launch script ───────────────────────────
+# ── 8. Create launch script ───────────────────────────
 LAUNCHER="$SCRIPT_DIR/run.sh"
 cat > "$LAUNCHER" << 'EOF'
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export TK_SILENCE_DEPRECATION=1
+
+if [[ ! -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+    echo "Missing virtual environment at $SCRIPT_DIR/.venv"
+    echo "Run 'bash install_macos.sh' to create it with the Homebrew Python interpreter."
+    exit 1
+fi
+
 exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/poker_genius.py" "$@"
 EOF
 chmod +x "$LAUNCHER"

@@ -486,6 +486,11 @@ class PokerGeniusApp(tk.Tk):
         self.status_var.set(msg)
         self.update_idletasks()
 
+    def _set_pending_result(self, action: str, details: str):
+        self.action_label.config(text=action)
+        self.strategy_text.delete("1.0", tk.END)
+        self.strategy_text.insert(tk.END, details)
+
     # ── event handlers ───────────────────────────
     def _on_clear(self):
         self.ocr_text.delete("1.0", tk.END)
@@ -497,6 +502,9 @@ class PokerGeniusApp(tk.Tk):
 
     def _on_capture(self):
         self._set_status("Capturing screen…")
+        self.ocr_text.delete("1.0", tk.END)
+        self.ocr_text.insert(tk.END, "Capturing screen and running OCR...\n")
+        self._set_pending_result("Analyzing…", "Waiting for OCR results from the screen capture.")
         self.capture_btn.config(state=tk.DISABLED)
         threading.Thread(target=self._capture_worker, daemon=True).start()
 
@@ -507,6 +515,8 @@ class PokerGeniusApp(tk.Tk):
             self.after(0, lambda: self._display_ocr(raw_text, cards))
             self.after(0, lambda: self._run_analysis(cards))
         except Exception as exc:
+            self.after(0, lambda: self._display_ocr(f"Capture error: {exc}", []))
+            self.after(0, lambda: self._show_result("Capture failed", str(exc)))
             self.after(0, lambda: messagebox.showerror("Error", str(exc)))
             self.after(0, lambda: self._set_status("Error during capture."))
         finally:
@@ -555,13 +565,18 @@ class PokerGeniusApp(tk.Tk):
             pass
 
         self._set_status("Running Monte Carlo equity simulation…")
+        self._set_pending_result("Analyzing…", "Calculating equity and generating strategy advice.")
 
         def worker():
-            equity = monte_carlo_equity(hole, board,
-                                        num_opponents=num_opp, iterations=2000)
-            advice = gto_advice(hole, board, equity, street, position, pot_odds)
-            self.after(0, lambda: self._show_advice(advice, hole, board, street))
-            self.after(0, lambda: self._set_status("Analysis complete."))
+            try:
+                equity = monte_carlo_equity(hole, board,
+                                            num_opponents=num_opp, iterations=2000)
+                advice = gto_advice(hole, board, equity, street, position, pot_odds)
+                self.after(0, lambda: self._show_advice(advice, hole, board, street))
+                self.after(0, lambda: self._set_status("Analysis complete."))
+            except Exception as exc:
+                self.after(0, lambda: self._show_result("Analysis failed", str(exc)))
+                self.after(0, lambda: self._set_status("Analysis failed."))
 
         threading.Thread(target=worker, daemon=True).start()
 
