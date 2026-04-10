@@ -344,9 +344,13 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         rank_ocr = None
         if rank_score < TEMPLATE_CONFIDENCE_THRESHOLD:
             rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
-        rank = rank_match
-        if rank_ocr and (rank_ocr == rank_match or rank_score < 0.38):
+        # Prefer template match when confident, otherwise use OCR
+        if rank_match and rank_score >= 0.38:
+            rank = rank_match
+        elif rank_ocr:
             rank = rank_ocr
+        else:
+            rank = rank_match
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
@@ -354,9 +358,13 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         suit_ocr = None
         if suit_score < TEMPLATE_CONFIDENCE_THRESHOLD:
             suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
-        suit = suit_match
-        if suit_ocr and suit_ocr in allowed_suits and (suit_ocr == suit_match or suit_score < 0.28):
+        # Prefer template match when confident, otherwise use OCR if it's in allowed suits
+        if suit_match and suit_score >= 0.28:
+            suit = suit_match
+        elif suit_ocr and suit_ocr in allowed_suits:
             suit = suit_ocr
+        else:
+            suit = suit_match
 
         if rank and suit:
             score = rank_score + suit_score
