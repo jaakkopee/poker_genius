@@ -221,20 +221,30 @@ def normalize_suit_symbol(text: str) -> Optional[str]:
 def estimate_red_suit(pil_image: Image.Image) -> bool:
     """Estimate whether the symbol is red or black from the original crop."""
     rgb = np.array(pil_image.convert("RGB"))
-    symbol_mask = normalize_symbol_patch(pil_image)
-    if symbol_mask is None:
-        return False
-
-    mask = cv2.resize(symbol_mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    
+    # Find foreground pixels directly from the original image
+    # (assuming symbol is darker than white background)
+    gray = np.array(pil_image.convert("L"))
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    mask = binary > 0
+    
     if not np.any(mask):
         return False
-
+    
     foreground = rgb[mask]
-    red_pixels = (
-        (foreground[:, 0] > foreground[:, 1] + 20)
-        & (foreground[:, 0] > foreground[:, 2] + 20)
+    
+    # Check if foreground is predominantly dark (black suits) or light/colored
+    avg_intensity = foreground.mean()
+    if avg_intensity < 65:
+        # Dark foreground → black suit (clubs/spades)
+        return False
+    
+    # For lighter/colored foreground, check for red dominance
+    red_dominant = (
+        (foreground[:, 0] > foreground[:, 1] + 15)
+        & (foreground[:, 0] > foreground[:, 2] + 15)
     ).mean()
-    return bool(red_pixels > 0.20)
+    return bool(red_dominant > 0.25)
 
 
 def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], Tuple[float, float], float]) -> Image.Image:
@@ -907,6 +917,10 @@ class PokerGeniusApp(tk.Tk):
 
         hole  = cards[:2]
         board = cards[2:7]
+        
+        # Pre-flop uses only hole cards for equity simulation
+        if street == "Pre-Flop":
+            board = []
 
         street_sel = self.street_var.get()
         if street_sel == "Auto-detect":
