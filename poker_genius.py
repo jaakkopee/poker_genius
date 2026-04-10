@@ -235,18 +235,27 @@ def estimate_red_suit(pil_image: Image.Image) -> bool:
     
     foreground = rgb[mask]
     
-    # Check if foreground is predominantly dark (black suits) or light/colored
+    # Calculate average RGB values
+    avg_r = foreground[:, 0].mean()
+    avg_g = foreground[:, 1].mean()
+    avg_b = foreground[:, 2].mean()
+    
+    # Check for red dominance (red channel significantly higher than green and blue)
+    # Red suits have R > G and R > B
+    red_score = (avg_r - avg_g) + (avg_r - avg_b)
+    
+    # If red channel is clearly dominant, it's a red suit
+    if red_score > 20:  # Red is at least 10 higher than both G and B on average
+        return True
+    
+    # Check overall darkness - pure black suits will have very low values across all channels
     avg_intensity = foreground.mean()
-    if avg_intensity < 65:
-        # Dark foreground → black suit (clubs/spades)
+    if avg_intensity < 50:  # Very dark → black suit
         return False
     
-    # For lighter/colored foreground, check for red dominance
-    red_dominant = (
-        (foreground[:, 0] > foreground[:, 1] + 15)
-        & (foreground[:, 0] > foreground[:, 2] + 15)
-    ).mean()
-    return bool(red_dominant > 0.25)
+    # For medium-dark colors, check red ratio
+    red_ratio = avg_r / (avg_r + avg_g + avg_b + 1e-6)
+    return red_ratio > 0.38  # Red channel is > 38% of total
 
 
 def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], Tuple[float, float], float]) -> Image.Image:
@@ -345,25 +354,37 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates())
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         
-        # Choose best rank: prefer template if score is decent, otherwise OCR
-        if rank_match and rank_score >= rank_threshold:
-            rank = rank_match
+        # Choose best rank: always prefer template match if it exists, unless OCR has very strong agreement
+        if rank_match and rank_ocr and rank_match == rank_ocr:
+            rank = rank_match  # Both agree - definitely correct
+        elif rank_match and rank_score >= rank_threshold:
+            rank = rank_match  # Template is confident
+        elif rank_match and not rank_ocr:
+            rank = rank_match  # OCR failed, use template
+        elif rank_match and rank_score >= 0.15:
+            rank = rank_match  # Template has some confidence, OCR often wrong
         elif rank_ocr:
-            rank = rank_ocr
+            rank = rank_ocr  # Last resort: use OCR
         else:
-            rank = rank_match
+            rank = rank_match  # Ultimate fallback
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
         suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
         
-        # Choose best suit: prefer template if score is decent and in allowed set
-        if suit_match and suit_score >= suit_threshold and suit_match in allowed_suits:
-            suit = suit_match
+        # Choose best suit: prefer template match over OCR generally
+        if suit_match and suit_ocr and suit_match == suit_ocr and suit_match in allowed_suits:
+            suit = suit_match  # Both agree and in allowed set
+        elif suit_match and suit_score >= suit_threshold and suit_match in allowed_suits:
+            suit = suit_match  # Template is confident
+        elif suit_match and suit_match in allowed_suits and suit_score >= 0.1:
+            suit = suit_match  # Template has some confidence in allowed suit
         elif suit_ocr and suit_ocr in allowed_suits:
-            suit = suit_ocr
+            suit = suit_ocr  # OCR result in allowed set
+        elif suit_match:
+            suit = suit_match  # Template result even if not in allowed (color detection may be wrong)
         else:
-            suit = suit_match
+            suit = suit_ocr  # Last resort
         
         # Debug output
         print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}")
@@ -800,8 +821,8 @@ class PokerGeniusApp(tk.Tk):
         self.ocr_rotation_angles = [-5, 0, 5]
         self.ocr_angle_step = 5
         self.ocr_orientations = [0, 180]
-        self.ocr_rank_threshold = 0.35
-        self.ocr_suit_threshold = 0.25
+        self.ocr_rank_threshold = 0.20  # Lower threshold to trust template matching more
+        self.ocr_suit_threshold = 0.15  # Lower threshold for suits
         self.ocr_upscale_factor = 2
         
         # Screen capture region (None = full screen)
@@ -1055,8 +1076,8 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rotation_angles = [-5, 0, 5]
             self.ocr_angle_step = 5
             self.ocr_orientations = [0, 180]
-            self.ocr_rank_threshold = 0.35
-            self.ocr_suit_threshold = 0.25
+            self.ocr_rank_threshold = 0.20
+            self.ocr_suit_threshold = 0.15
             self.ocr_upscale_factor = 2
             self._set_status("OCR parameters reset to defaults")
             win.destroy()
