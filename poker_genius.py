@@ -924,7 +924,7 @@ class PokerGeniusApp(tk.Tk):
         """Open window to configure OCR parameters."""
         win = tk.Toplevel(self)
         win.title("OCR Parameters")
-        win.geometry("500x520")
+        win.geometry("500x600")
         win.configure(bg=self.BG)
         win.transient(self)
         
@@ -935,7 +935,7 @@ class PokerGeniusApp(tk.Tk):
         
         # Main content frame
         content = tk.Frame(win, bg=B)
-        content.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        content.pack(fill=tk.X, padx=20, pady=10)
         
         # Rotation angles
         tk.Label(content, text="Rotation Angles (degrees):", 
