@@ -485,9 +485,9 @@ def parse_cards_from_text(text: str) -> List[str]:
 
 def capture_and_ocr(rotation_angles: list = None, orientations: list = None, 
                     upscale_factor: int = 2, rank_threshold: float = 0.35, 
-                    suit_threshold: float = 0.25) -> Tuple[str, List[str]]:
-    """Capture full screen, OCR multiple tilt angles, and return the best text plus merged cards."""
-    screenshot = ImageGrab.grab()
+                    suit_threshold: float = 0.25, bbox: tuple = None) -> Tuple[str, List[str]]:
+    """Capture screen region (or full screen), OCR multiple tilt angles, and return the best text plus merged cards."""
+    screenshot = ImageGrab.grab(bbox=bbox)
     return ocr_cards_from_image(screenshot, rotation_angles, orientations, upscale_factor, 
                                  rank_threshold, suit_threshold)
 
@@ -795,10 +795,14 @@ class PokerGeniusApp(tk.Tk):
         
         # OCR Parameters (configurable)
         self.ocr_rotation_angles = [-5, 0, 5]
+        self.ocr_angle_step = 5
         self.ocr_orientations = [0, 180]
         self.ocr_rank_threshold = 0.35
         self.ocr_suit_threshold = 0.25
         self.ocr_upscale_factor = 2
+        
+        # Screen capture region (None = full screen)
+        self.capture_bbox = None
         
         self._build_ui()
 
@@ -868,6 +872,8 @@ class PokerGeniusApp(tk.Tk):
         self.capture_btn.pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Analyze Manual Input", self._on_manual).pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Clear", self._on_clear).pack(side=tk.LEFT, padx=6)
+        self.board_area_btn = self._btn(bf, "Set Board Area", self._set_board_area)
+        self.board_area_btn.pack(side=tk.LEFT, padx=6)
         self._btn(bf, "OCR Parameters", self._open_ocr_params).pack(side=tk.LEFT, padx=6)
 
         # ── OCR output ─────────────────────────────
@@ -957,7 +963,7 @@ class PokerGeniusApp(tk.Tk):
                    bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
         
         tk.Label(angles_frame, text="Step:", bg=B, fg=F).pack(side=tk.LEFT, padx=(12,4))
-        angle_step_var = tk.IntVar(value=5)
+        angle_step_var = tk.IntVar(value=self.ocr_angle_step)
         tk.Spinbox(angles_frame, from_=1, to=10, width=3, textvariable=angle_step_var,
                    bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
         
@@ -1028,6 +1034,7 @@ class PokerGeniusApp(tk.Tk):
                     angles.append(0)
                     angles.sort()
                 self.ocr_rotation_angles = angles
+                self.ocr_angle_step = step
             
             # Build orientations list
             self.ocr_orientations = [ang for ang, var in orient_vars.items() if var.get()]
@@ -1043,6 +1050,7 @@ class PokerGeniusApp(tk.Tk):
         
         def reset():
             self.ocr_rotation_angles = [-5, 0, 5]
+            self.ocr_angle_step = 5
             self.ocr_orientations = [0, 180]
             self.ocr_rank_threshold = 0.35
             self.ocr_suit_threshold = 0.25
@@ -1053,6 +1061,163 @@ class PokerGeniusApp(tk.Tk):
         self._btn(btn_frame, "Apply", apply).pack(side=tk.LEFT, padx=6)
         self._btn(btn_frame, "Reset to Defaults", reset).pack(side=tk.LEFT, padx=6)
         self._btn(btn_frame, "Cancel", win.destroy).pack(side=tk.LEFT, padx=6)
+    
+    def _set_board_area(self):
+        """Open transparent overlay to select screen capture region."""
+        # Create fullscreen transparent overlay
+        overlay = tk.Toplevel(self)
+        overlay.attributes('-fullscreen', True)
+        overlay.attributes('-alpha', 0.3)
+        overlay.configure(bg='black')
+        overlay.attributes('-topmost', True)
+        
+        # Canvas for drawing the selection rectangle
+        canvas = tk.Canvas(overlay, highlightthickness=0, bg='black')
+        canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Initial rectangle (center of screen)
+        screen_w = overlay.winfo_screenwidth()
+        screen_h = overlay.winfo_screenheight()
+        rect_w, rect_h = 800, 600
+        rect_x1 = (screen_w - rect_w) // 2
+        rect_y1 = (screen_h - rect_h) // 2
+        rect_x2 = rect_x1 + rect_w
+        rect_y2 = rect_y1 + rect_h
+        
+        # Draw red rectangle with 5px border
+        rect = canvas.create_rectangle(rect_x1, rect_y1, rect_x2, rect_y2,
+                                       outline='red', width=5, fill='')
+        
+        # Instructions
+        info_text = canvas.create_text(screen_w // 2, 30,
+                                       text="Drag to move | Drag corners/edges to resize | ENTER to confirm | ESC to cancel | DELETE to reset",
+                                       fill='white', font=('Helvetica', 14, 'bold'))
+        
+        # State for dragging
+        drag_data = {'item': None, 'x': 0, 'y': 0, 'mode': None}
+        
+        def get_cursor_mode(x, y):
+            """Determine if cursor is on edge/corner for resizing."""
+            coords = canvas.coords(rect)
+            if not coords:
+                return None
+            x1, y1, x2, y2 = coords
+            margin = 15
+            
+            on_left = abs(x - x1) < margin
+            on_right = abs(x - x2) < margin
+            on_top = abs(y - y1) < margin
+            on_bottom = abs(y - y2) < margin
+            
+            if on_top and on_left:
+                return 'nw'
+            elif on_top and on_right:
+                return 'ne'
+            elif on_bottom and on_left:
+                return 'sw'
+            elif on_bottom and on_right:
+                return 'se'
+            elif on_left:
+                return 'w'
+            elif on_right:
+                return 'e'
+            elif on_top:
+                return 'n'
+            elif on_bottom:
+                return 's'
+            elif x1 < x < x2 and y1 < y < y2:
+                return 'move'
+            return None
+        
+        def on_press(event):
+            drag_data['x'] = event.x
+            drag_data['y'] = event.y
+            drag_data['mode'] = get_cursor_mode(event.x, event.y)
+        
+        def on_drag(event):
+            if drag_data['mode'] is None:
+                return
+            
+            dx = event.x - drag_data['x']
+            dy = event.y - drag_data['y']
+            coords = canvas.coords(rect)
+            x1, y1, x2, y2 = coords
+            
+            mode = drag_data['mode']
+            
+            if mode == 'move':
+                # Move entire rectangle
+                canvas.coords(rect, x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+            elif mode == 'nw':
+                canvas.coords(rect, x1 + dx, y1 + dy, x2, y2)
+            elif mode == 'ne':
+                canvas.coords(rect, x1, y1 + dy, x2 + dx, y2)
+            elif mode == 'sw':
+                canvas.coords(rect, x1 + dx, y1, x2, y2 + dy)
+            elif mode == 'se':
+                canvas.coords(rect, x1, y1, x2 + dx, y2 + dy)
+            elif mode == 'n':
+                canvas.coords(rect, x1, y1 + dy, x2, y2)
+            elif mode == 's':
+                canvas.coords(rect, x1, y1, x2, y2 + dy)
+            elif mode == 'w':
+                canvas.coords(rect, x1 + dx, y1, x2, y2)
+            elif mode == 'e':
+                canvas.coords(rect, x1, y1, x2 + dx, y2)
+            
+            drag_data['x'] = event.x
+            drag_data['y'] = event.y
+        
+        def on_motion(event):
+            """Update cursor based on position."""
+            mode = get_cursor_mode(event.x, event.y)
+            if mode == 'move':
+                canvas.config(cursor='fleur')
+            elif mode in ('nw', 'se'):
+                canvas.config(cursor='size_nw_se')
+            elif mode in ('ne', 'sw'):
+                canvas.config(cursor='size_ne_sw')
+            elif mode in ('n', 's'):
+                canvas.config(cursor='size_ns')
+            elif mode in ('w', 'e'):
+                canvas.config(cursor='size_ew')
+            else:
+                canvas.config(cursor='arrow')
+        
+        def confirm(event=None):
+            coords = canvas.coords(rect)
+            if coords:
+                x1, y1, x2, y2 = coords
+                # Ensure proper ordering
+                self.capture_bbox = (
+                    int(min(x1, x2)),
+                    int(min(y1, y2)),
+                    int(max(x1, x2)),
+                    int(max(y1, y2))
+                )
+                w = self.capture_bbox[2] - self.capture_bbox[0]
+                h = self.capture_bbox[3] - self.capture_bbox[1]
+                self.board_area_btn.config(text=f"Board Area: {w}x{h}")
+                self._set_status(f"Board area set: {w}x{h} pixels")
+            overlay.destroy()
+        
+        def cancel(event=None):
+            overlay.destroy()
+        
+        def reset_area(event=None):
+            self.capture_bbox = None
+            self.board_area_btn.config(text="Set Board Area")
+            self._set_status("Board area reset to full screen")
+            overlay.destroy()
+        
+        canvas.bind('<ButtonPress-1>', on_press)
+        canvas.bind('<B1-Motion>', on_drag)
+        canvas.bind('<Motion>', on_motion)
+        overlay.bind('<Return>', confirm)
+        overlay.bind('<Escape>', cancel)
+        overlay.bind('<Delete>', reset_area)
+        overlay.bind('<BackSpace>', reset_area)
+        overlay.focus_set()
 
     def _on_capture(self):
         self._set_status("Capturing screen…")
@@ -1069,7 +1234,8 @@ class PokerGeniusApp(tk.Tk):
                 self.ocr_orientations,
                 self.ocr_upscale_factor,
                 self.ocr_rank_threshold,
-                self.ocr_suit_threshold
+                self.ocr_suit_threshold,
+                self.capture_bbox
             )
             self.after(0, lambda: self._display_ocr(raw_text, cards))
             self.after(0, lambda: self._run_analysis(cards))
