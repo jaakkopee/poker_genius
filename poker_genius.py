@@ -1064,16 +1064,32 @@ class PokerGeniusApp(tk.Tk):
     
     def _set_board_area(self):
         """Open transparent overlay to select screen capture region."""
-        # Create fullscreen transparent overlay
+        # Minimize main window to get clean screenshot
+        self.iconify()
+        self.update()
+        
+        # Wait a moment for window to minimize
+        import time
+        time.sleep(0.2)
+        
+        # Capture current screen
+        screenshot = ImageGrab.grab()
+        
+        # Create fullscreen overlay window
         overlay = tk.Toplevel(self)
         overlay.attributes('-fullscreen', True)
-        overlay.attributes('-alpha', 0.3)
-        overlay.configure(bg='black')
         overlay.attributes('-topmost', True)
+        overlay.configure(bg='black')
         
-        # Canvas for drawing the selection rectangle
-        canvas = tk.Canvas(overlay, highlightthickness=0, bg='black')
+        # Canvas for drawing
+        canvas = tk.Canvas(overlay, highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Display screenshot as background
+        from PIL import ImageTk
+        photo = ImageTk.PhotoImage(screenshot)
+        canvas.create_image(0, 0, image=photo, anchor=tk.NW)
+        canvas.image = photo  # Keep reference
         
         # Initial rectangle (center of screen)
         screen_w = overlay.winfo_screenwidth()
@@ -1088,10 +1104,11 @@ class PokerGeniusApp(tk.Tk):
         rect = canvas.create_rectangle(rect_x1, rect_y1, rect_x2, rect_y2,
                                        outline='red', width=5, fill='')
         
-        # Instructions
+        # Instructions with semi-transparent background
+        text_bg = canvas.create_rectangle(0, 0, screen_w, 60, fill='black', stipple='gray50')
         info_text = canvas.create_text(screen_w // 2, 30,
                                        text="Drag to move | Drag corners/edges to resize | ENTER to confirm | ESC to cancel | DELETE to reset",
-                                       fill='white', font=('Helvetica', 14, 'bold'))
+                                       fill='yellow', font=('Helvetica', 14, 'bold'))
         
         # State for dragging
         drag_data = {'item': None, 'x': 0, 'y': 0, 'mode': None}
@@ -1200,15 +1217,18 @@ class PokerGeniusApp(tk.Tk):
                 self.board_area_btn.config(text=f"Board Area: {w}x{h}")
                 self._set_status(f"Board area set: {w}x{h} pixels")
             overlay.destroy()
+            self.deiconify()
         
         def cancel(event=None):
             overlay.destroy()
+            self.deiconify()
         
         def reset_area(event=None):
             self.capture_bbox = None
             self.board_area_btn.config(text="Set Board Area")
             self._set_status("Board area reset to full screen")
             overlay.destroy()
+            self.deiconify()
         
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_drag)
