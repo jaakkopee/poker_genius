@@ -340,12 +340,10 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         suit_crop = corner.crop((0, int(corner.height * 0.38), int(corner.width * 0.68), int(corner.height * 0.95)))
 
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates())
-        # Skip OCR if template matching is confident
-        rank_ocr = None
-        if rank_score < TEMPLATE_CONFIDENCE_THRESHOLD:
-            rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
-        # Prefer template match when confident, otherwise use OCR
-        if rank_match and rank_score >= 0.38:
+        rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
+        
+        # Choose best rank: prefer template if score is decent, otherwise OCR
+        if rank_match and rank_score >= 0.35:
             rank = rank_match
         elif rank_ocr:
             rank = rank_ocr
@@ -354,17 +352,17 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
-        # Skip OCR if template matching is confident
-        suit_ocr = None
-        if suit_score < TEMPLATE_CONFIDENCE_THRESHOLD:
-            suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
-        # Prefer template match when confident, otherwise use OCR if it's in allowed suits
-        if suit_match and suit_score >= 0.28:
+        suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
+        
+        # Choose best suit: prefer template if score is decent and in allowed set
+        if suit_match and suit_score >= 0.25 and suit_match in allowed_suits:
             suit = suit_match
         elif suit_ocr and suit_ocr in allowed_suits:
             suit = suit_ocr
         else:
             suit = suit_match
+        
+        print(f"DEBUG: orientation={orientation} rank_match={rank_match}({rank_score:.3f}) rank_ocr={rank_ocr} -> {rank} | allowed={allowed_suits} suit_match={suit_match}({suit_score:.3f}) suit_ocr={suit_ocr} -> {suit}")
 
         if rank and suit:
             score = rank_score + suit_score
