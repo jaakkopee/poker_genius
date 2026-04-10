@@ -6,11 +6,12 @@ import tkinter as tk
 from tkinter import scrolledtext, messagebox
 import threading
 import re
+from functools import lru_cache
 from itertools import combinations
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import pytesseract
-from PIL import Image, ImageGrab, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab
 import cv2
 import numpy as np
 
@@ -37,16 +38,381 @@ SUIT_ALIASES = {
 }
 
 RANK_VALUES = {r: i for i, r in enumerate(RANKS)}
+OCR_ROTATION_ANGLES = (-15, -10, -5, 0, 5, 10, 15)
+OCR_CONFIG = "--psm 11"
+CARD_CANVAS = (180, 252)
+SYMBOL_TEMPLATE_SIZE = (64, 64)
+CARD_MASK_LOW = np.array([0, 0, 140], dtype=np.uint8)
+CARD_MASK_HIGH = np.array([180, 105, 255], dtype=np.uint8)
+SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
+RED_SUITS = {"d", "h"}
+BLACK_SUITS = {"c", "s"}
+FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+)
 
 
 def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
     """Enhance image for better OCR accuracy on card text."""
-    img = pil_image.convert("L")
-    img = img.filter(ImageFilter.SHARPEN)
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.5)
-    img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-    return img
+    gray = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    thresholded = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+    processed = Image.fromarray(cv2.medianBlur(thresholded, 3))
+    processed = processed.filter(ImageFilter.SHARPEN)
+    processed = ImageEnhance.Contrast(processed).enhance(2.0)
+    return processed.resize((processed.width * 3, processed.height * 3), Image.LANCZOS)
+
+
+def order_points(points: np.ndarray) -> np.ndarray:
+    """Return rectangle corners ordered as top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype="float32")
+    sums = points.sum(axis=1)
+    rect[0] = points[np.argmin(sums)]
+    rect[2] = points[np.argmax(sums)]
+    diffs = np.diff(points, axis=1)
+    rect[1] = points[np.argmin(diffs)]
+    rect[3] = points[np.argmax(diffs)]
+    return rect
+
+
+def normalize_symbol_patch(pil_image: Image.Image, size: Tuple[int, int] = SYMBOL_TEMPLATE_SIZE) -> Optional[np.ndarray]:
+    """Convert a symbol crop into a centered binary patch for OCR/template matching."""
+    gray = np.array(pil_image.convert("L"))
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    points = cv2.findNonZero(binary)
+    if points is None:
+        return None
+
+    x, y, width, height = cv2.boundingRect(points)
+    if width < 2 or height < 2:
+        return None
+
+    cropped = binary[y:y + height, x:x + width]
+    pad = max(4, int(max(width, height) * 0.15))
+    cropped = cv2.copyMakeBorder(cropped, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    return cv2.resize(cropped, size, interpolation=cv2.INTER_AREA)
+
+
+@lru_cache(maxsize=8)
+def load_template_fonts(size: int) -> Tuple[ImageFont.FreeTypeFont, ...]:
+    """Load a small set of fonts that can render card ranks and suit symbols."""
+    fonts = []
+    for path in FONT_CANDIDATES:
+        try:
+            fonts.append(ImageFont.truetype(path, size))
+        except OSError:
+            continue
+
+    if not fonts:
+        fonts.append(ImageFont.load_default())
+    return tuple(fonts)
+
+
+def render_template_variants(symbol: str, font_size: int) -> List[np.ndarray]:
+    """Render one or more binary templates for a rank or suit symbol."""
+    templates = []
+    for font in load_template_fonts(font_size):
+        canvas = Image.new("L", (128, 128), 255)
+        draw = ImageDraw.Draw(canvas)
+        bbox = draw.textbbox((0, 0), symbol, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        draw.text(
+            ((canvas.width - text_w) / 2 - bbox[0], (canvas.height - text_h) / 2 - bbox[1]),
+            symbol,
+            font=font,
+            fill=0,
+        )
+        normalized = normalize_symbol_patch(canvas)
+        if normalized is not None:
+            templates.append(normalized)
+    return templates
+
+
+@lru_cache(maxsize=1)
+def get_rank_templates() -> dict:
+    """Build canonical rank templates, including a dedicated 10 glyph variant."""
+    variants = {rank: [rank] for rank in RANKS}
+    variants["T"] = ["10", "T"]
+    return {
+        rank: [template for text in texts for template in render_template_variants(text, 72)]
+        for rank, texts in variants.items()
+    }
+
+
+@lru_cache(maxsize=1)
+def get_suit_templates() -> dict:
+    """Build suit templates using both suit symbols and fallback letters."""
+    return {
+        suit: [
+            template
+            for text in (SUIT_SYMBOLS[suit], suit.upper())
+            for template in render_template_variants(text, 66)
+        ]
+        for suit in SUITS
+    }
+
+
+def template_match_symbol(pil_image: Image.Image, templates: dict, allowed: Optional[set] = None) -> Tuple[Optional[str], float]:
+    """Return the best matching canonical symbol and its normalized correlation score."""
+    normalized = normalize_symbol_patch(pil_image)
+    if normalized is None:
+        return None, 0.0
+
+    best_symbol = None
+    best_score = 0.0
+    candidate = normalized.astype(np.float32)
+    for symbol, variants in templates.items():
+        if allowed and symbol not in allowed:
+            continue
+        for template in variants:
+            score = float(cv2.matchTemplate(candidate, template.astype(np.float32), cv2.TM_CCOEFF_NORMED)[0][0])
+            if score > best_score:
+                best_symbol = symbol
+                best_score = score
+
+    return best_symbol, best_score
+
+
+def ocr_single_symbol(pil_image: Image.Image, whitelist: str) -> str:
+    """Run Tesseract on a tight symbol crop."""
+    normalized = normalize_symbol_patch(pil_image)
+    if normalized is None:
+        return ""
+    ocr_image = Image.fromarray(255 - normalized)
+    return pytesseract.image_to_string(
+        ocr_image,
+        config=f"--psm 10 -c tessedit_char_whitelist={whitelist}",
+    ).strip()
+
+
+def normalize_rank_symbol(text: str) -> Optional[str]:
+    """Normalize OCR/template output to a canonical rank."""
+    cleaned = re.sub(r"[^0-9TJQKAIO]", "", text.upper())
+    if not cleaned:
+        return None
+    if "10" in cleaned or "TO" in cleaned or cleaned.startswith("T"):
+        return "T"
+    return RANK_ALIASES.get(cleaned[0])
+
+
+def normalize_suit_symbol(text: str) -> Optional[str]:
+    """Normalize OCR/template output to a canonical suit."""
+    for token in text:
+        suit = SUIT_ALIASES.get(token.lower())
+        if suit:
+            return suit
+    return None
+
+
+def estimate_red_suit(pil_image: Image.Image) -> bool:
+    """Estimate whether the symbol is red or black from the original crop."""
+    rgb = np.array(pil_image.convert("RGB"))
+    symbol_mask = normalize_symbol_patch(pil_image)
+    if symbol_mask is None:
+        return False
+
+    mask = cv2.resize(symbol_mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    if not np.any(mask):
+        return False
+
+    foreground = rgb[mask]
+    red_pixels = (
+        (foreground[:, 0] > foreground[:, 1] + 20)
+        & (foreground[:, 0] > foreground[:, 2] + 20)
+    ).mean()
+    return bool(red_pixels > 0.20)
+
+
+def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], Tuple[float, float], float]) -> Image.Image:
+    """Perspective-warp a candidate contour into a standard portrait card canvas."""
+    source = order_points(cv2.boxPoints(rect).astype("float32"))
+    destination = np.array(
+        [
+            [0, 0],
+            [CARD_CANVAS[0] - 1, 0],
+            [CARD_CANVAS[0] - 1, CARD_CANVAS[1] - 1],
+            [0, CARD_CANVAS[1] - 1],
+        ],
+        dtype="float32",
+    )
+    transform = cv2.getPerspectiveTransform(source, destination)
+    warped = cv2.warpPerspective(rgb_image, transform, CARD_CANVAS)
+    return Image.fromarray(warped)
+
+
+def find_card_regions(pil_image: Image.Image) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int]]]:
+    """Locate bright, card-shaped regions and rectify them into portrait card crops."""
+    rgb = np.array(pil_image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, CARD_MASK_LOW, CARD_MASK_HIGH)
+    kernel = np.ones((7, 7), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = rgb.shape[0] * rgb.shape[1]
+    min_area = max(2500, image_area * 0.001)
+    max_area = image_area * 0.08
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area > max_area:
+            continue
+
+        rect = cv2.minAreaRect(contour)
+        (center_x, center_y), (width, height), _ = rect
+        if min(width, height) < 40:
+            continue
+
+        short_side, long_side = sorted((width, height))
+        ratio = short_side / long_side
+        fill_ratio = area / max(width * height, 1)
+        if not (0.50 <= ratio <= 0.82 and fill_ratio >= 0.45):
+            continue
+
+        x, y, box_w, box_h = cv2.boundingRect(contour)
+        warped = rectify_card_region(rgb, rect)
+        warped_hsv = cv2.cvtColor(np.array(warped.convert("RGB")), cv2.COLOR_RGB2HSV)
+        white_ratio = float((cv2.inRange(warped_hsv, CARD_MASK_LOW, CARD_MASK_HIGH) > 0).mean())
+        if white_ratio < 0.55:
+            continue
+        candidates.append(((int(center_x), int(center_y)), warped, (x, y, box_w, box_h), area))
+
+    candidates.sort(key=lambda item: item[3], reverse=True)
+    deduped = []
+    for center, warped, bbox, area in candidates:
+        if any(abs(center[0] - prev_center[0]) < 35 and abs(center[1] - prev_center[1]) < 35 for prev_center, _, _, _ in deduped):
+            continue
+        deduped.append((center, warped, bbox, area))
+
+    deduped.sort(key=lambda item: (item[0][1], item[0][0]))
+    return [(center, warped, bbox) for center, warped, bbox, _ in deduped]
+
+
+def rotate_for_ocr(pil_image: Image.Image, angle: int) -> Image.Image:
+    """Rotate image to help OCR recover tilted ranks and suits."""
+    if angle == 0:
+        return pil_image
+    return pil_image.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(0, 0, 0))
+
+
+def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], float, str]:
+    """Recognize a card from a rectified crop using template matching with OCR fallback."""
+    best_card = None
+    best_score = 0.0
+    best_debug = ""
+
+    for orientation in (0, 90, 180, 270):
+        oriented = rotate_for_ocr(card_image, orientation)
+        if oriented.width > oriented.height:
+            oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
+        oriented = oriented.resize(CARD_CANVAS, Image.LANCZOS)
+
+        corner = oriented.crop((0, 0, int(oriented.width * 0.36), int(oriented.height * 0.31)))
+        rank_crop = corner.crop((0, 0, int(corner.width * 0.58), int(corner.height * 0.52)))
+        suit_crop = corner.crop((0, int(corner.height * 0.38), int(corner.width * 0.68), int(corner.height * 0.95)))
+
+        rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates())
+        rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
+        rank = rank_match
+        if rank_ocr and (rank_ocr == rank_match or rank_score < 0.38):
+            rank = rank_ocr
+
+        allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
+        suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits)
+        suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
+        suit = suit_match
+        if suit_ocr and suit_ocr in allowed_suits and (suit_ocr == suit_match or suit_score < 0.28):
+            suit = suit_ocr
+
+        if rank and suit:
+            score = rank_score + suit_score
+            if score > best_score:
+                best_card = rank + suit
+                best_score = score
+                best_debug = (
+                    f"orientation={orientation} rank={rank}({rank_score:.2f}/{rank_ocr or '-'}) "
+                    f"suit={suit}({suit_score:.2f}/{suit_ocr or '-'})"
+                )
+
+    return best_card, best_score, best_debug
+
+
+def detect_cards_by_regions(pil_image: Image.Image) -> Tuple[List[str], List[str]]:
+    """Detect cards from likely card regions using template matching and region-local OCR."""
+    cards = []
+    debug_lines = []
+    detections = []
+
+    for index, (center, card_image, bbox) in enumerate(find_card_regions(pil_image), start=1):
+        card, score, debug = recognize_card_from_region(card_image)
+        if not card:
+            debug_lines.append(f"region {index} @ {center}: no card match")
+            continue
+        detections.append((center, card, score, bbox, debug))
+
+    detections.sort(key=lambda item: item[2], reverse=True)
+    if len(detections) > 7:
+        detections = detections[:7]
+    detections.sort(key=lambda item: (item[0][1], item[0][0]))
+
+    for center, card, score, bbox, debug in detections:
+        if card not in cards:
+            cards.append(card)
+        debug_lines.append(f"region {center} bbox={bbox} -> {card} score={score:.2f} {debug}")
+
+    return cards, debug_lines
+
+
+def ocr_cards_from_image(pil_image: Image.Image) -> Tuple[str, List[str]]:
+    """Use region detection first, then multi-angle OCR as a fallback and supplement."""
+    region_cards, region_debug = detect_cards_by_regions(pil_image)
+    all_cards = list(region_cards)
+    best_cards: List[str] = []
+    best_text = ""
+    best_angle = 0
+    best_score = (-1, 0)
+
+    for angle in OCR_ROTATION_ANGLES:
+        rotated = rotate_for_ocr(pil_image, angle)
+        processed = preprocess_for_ocr(rotated)
+        text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
+        cards = parse_cards_from_text(text)
+
+        for card in cards:
+            if card not in all_cards and len(all_cards) < 7:
+                all_cards.append(card)
+
+        score = (len(cards), -abs(angle))
+        if score > best_score:
+            best_score = score
+            best_text = text
+            best_cards = cards
+            best_angle = angle
+
+    merged_cards = all_cards if all_cards else best_cards
+    preview_lines = [f"Region detector found: {', '.join(region_cards) if region_cards else 'none'}"]
+    preview_lines.extend(region_debug[:8])
+    preview_lines.append(f"Best full-image OCR angle: {best_angle}°")
+    if merged_cards and merged_cards != best_cards:
+        preview_lines.append(f"Merged cards: {', '.join(merged_cards)}")
+
+    return "\n".join(preview_lines) + "\n" + best_text, merged_cards
 
 
 def parse_cards_from_text(text: str) -> List[str]:
@@ -55,11 +421,9 @@ def parse_cards_from_text(text: str) -> List[str]:
     Returns a list of canonical card strings e.g. ['Ah', 'Kd'].
     """
     text = text.upper().replace("♣", "C").replace("♦", "D").replace("♥", "H").replace("♠", "S")
-    # Normalise common OCR confusions
-    text = text.replace("0", "O").replace("1O", "TO").replace("IO", "TO")
 
-    # Match patterns like: A H, K D, 10H, TH, 2 S ...
-    pattern = re.compile(r'\b(10|[2-9TJQKA])\s*([CDHS])\b', re.IGNORECASE)
+    # Match patterns like: A H, K D, 10H, TH, 1OH, IOH, 2 S ...
+    pattern = re.compile(r'\b(10|1O|IO|[2-9TJQKA])\s*([CDHS])\b', re.IGNORECASE)
     cards = []
     for m in pattern.finditer(text):
         rank_raw = m.group(1).upper()
@@ -73,12 +437,10 @@ def parse_cards_from_text(text: str) -> List[str]:
     return cards
 
 
-def capture_and_ocr() -> str:
-    """Capture full screen and return raw OCR text."""
+def capture_and_ocr() -> Tuple[str, List[str]]:
+    """Capture full screen, OCR multiple tilt angles, and return the best text plus merged cards."""
     screenshot = ImageGrab.grab()
-    processed = preprocess_for_ocr(screenshot)
-    text = pytesseract.image_to_string(processed, config="--psm 6")
-    return text
+    return ocr_cards_from_image(screenshot)
 
 
 # ──────────────────────────────────────────────
@@ -510,8 +872,7 @@ class PokerGeniusApp(tk.Tk):
 
     def _capture_worker(self):
         try:
-            raw_text = capture_and_ocr()
-            cards = parse_cards_from_text(raw_text)
+            raw_text, cards = capture_and_ocr()
             self.after(0, lambda: self._display_ocr(raw_text, cards))
             self.after(0, lambda: self._run_analysis(cards))
         except Exception as exc:
