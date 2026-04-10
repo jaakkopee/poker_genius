@@ -58,7 +58,7 @@ FONT_CANDIDATES = (
 )
 
 
-def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
+def preprocess_for_ocr(pil_image: Image.Image, upscale_factor: int = 2) -> Image.Image:
     """Enhance image for better OCR accuracy on card text."""
     gray = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -74,7 +74,7 @@ def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
     processed = Image.fromarray(cv2.medianBlur(thresholded, 3))
     processed = processed.filter(ImageFilter.SHARPEN)
     processed = ImageEnhance.Contrast(processed).enhance(2.0)
-    return processed.resize((processed.width * 2, processed.height * 2), Image.LANCZOS)
+    return processed.resize((processed.width * upscale_factor, processed.height * upscale_factor), Image.LANCZOS)
 
 
 def order_points(points: np.ndarray) -> np.ndarray:
@@ -323,13 +323,16 @@ def rotate_for_ocr(pil_image: Image.Image, angle: int) -> Image.Image:
     return pil_image.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(0, 0, 0))
 
 
-def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], float, str]:
+def recognize_card_from_region(card_image: Image.Image, orientations: list = None, 
+                                 rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[Optional[str], float, str]:
     """Recognize a card from a rectified crop using template matching with OCR fallback."""
+    if orientations is None:
+        orientations = [0, 180]
     best_card = None
     best_score = 0.0
     best_debug = ""
 
-    for orientation in CARD_ORIENTATIONS:
+    for orientation in orientations:
         oriented = rotate_for_ocr(card_image, orientation)
         if oriented.width > oriented.height:
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
@@ -343,7 +346,7 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         
         # Choose best rank: prefer template if score is decent, otherwise OCR
-        if rank_match and rank_score >= 0.35:
+        if rank_match and rank_score >= rank_threshold:
             rank = rank_match
         elif rank_ocr:
             rank = rank_ocr
@@ -355,14 +358,12 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
         suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
         
         # Choose best suit: prefer template if score is decent and in allowed set
-        if suit_match and suit_score >= 0.25 and suit_match in allowed_suits:
+        if suit_match and suit_score >= suit_threshold and suit_match in allowed_suits:
             suit = suit_match
         elif suit_ocr and suit_ocr in allowed_suits:
             suit = suit_ocr
         else:
             suit = suit_match
-        
-        print(f"DEBUG: orientation={orientation} rank_match={rank_match}({rank_score:.3f}) rank_ocr={rank_ocr} -> {rank} | allowed={allowed_suits} suit_match={suit_match}({suit_score:.3f}) suit_ocr={suit_ocr} -> {suit}")
 
         if rank and suit:
             score = rank_score + suit_score
@@ -380,8 +381,11 @@ def recognize_card_from_region(card_image: Image.Image) -> Tuple[Optional[str], 
     return best_card, best_score, best_debug
 
 
-def detect_cards_by_regions(pil_image: Image.Image) -> Tuple[List[str], List[str]]:
+def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
+                             rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[List[str], List[str]]:
     """Detect cards from likely card regions using template matching and region-local OCR."""
+    if orientations is None:
+        orientations = [0, 180]
     cards = []
     debug_lines = []
     detections = []
@@ -406,9 +410,16 @@ def detect_cards_by_regions(pil_image: Image.Image) -> Tuple[List[str], List[str
     return cards, debug_lines
 
 
-def ocr_cards_from_image(pil_image: Image.Image) -> Tuple[str, List[str]]:
+def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None, 
+                          orientations: list = None, upscale_factor: int = 2,
+                          rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[str, List[str]]:
     """Use region detection first, then multi-angle OCR as a fallback and supplement."""
-    region_cards, region_debug = detect_cards_by_regions(pil_image)
+    if rotation_angles is None:
+        rotation_angles = [-5, 0, 5]
+    if orientations is None:
+        orientations = [0, 180]
+    
+    region_cards, region_debug = detect_cards_by_regions(pil_image, orientations, rank_threshold, suit_threshold)
     all_cards = list(region_cards)
     
     # Skip expensive full-image OCR if region detection found enough cards
@@ -423,9 +434,9 @@ def ocr_cards_from_image(pil_image: Image.Image) -> Tuple[str, List[str]]:
     best_angle = 0
     best_score = (-1, 0)
 
-    for angle in OCR_ROTATION_ANGLES:
+    for angle in rotation_angles:
         rotated = rotate_for_ocr(pil_image, angle)
-        processed = preprocess_for_ocr(rotated)
+        processed = preprocess_for_ocr(rotated, upscale_factor)
         text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
         cards = parse_cards_from_text(text)
 
@@ -472,10 +483,13 @@ def parse_cards_from_text(text: str) -> List[str]:
     return cards
 
 
-def capture_and_ocr() -> Tuple[str, List[str]]:
+def capture_and_ocr(rotation_angles: list = None, orientations: list = None, 
+                    upscale_factor: int = 2, rank_threshold: float = 0.35, 
+                    suit_threshold: float = 0.25) -> Tuple[str, List[str]]:
     """Capture full screen, OCR multiple tilt angles, and return the best text plus merged cards."""
     screenshot = ImageGrab.grab()
-    return ocr_cards_from_image(screenshot)
+    return ocr_cards_from_image(screenshot, rotation_angles, orientations, upscale_factor, 
+                                 rank_threshold, suit_threshold)
 
 
 # ──────────────────────────────────────────────
@@ -778,6 +792,14 @@ class PokerGeniusApp(tk.Tk):
         self.geometry("920x720")
         self.minsize(720, 600)
         self.configure(bg=self.BG)
+        
+        # OCR Parameters (configurable)
+        self.ocr_rotation_angles = [-5, 0, 5]
+        self.ocr_orientations = [0, 180]
+        self.ocr_rank_threshold = 0.35
+        self.ocr_suit_threshold = 0.25
+        self.ocr_upscale_factor = 2
+        
         self._build_ui()
 
     def _build_ui(self):
@@ -846,6 +868,7 @@ class PokerGeniusApp(tk.Tk):
         self.capture_btn.pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Analyze Manual Input", self._on_manual).pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Clear", self._on_clear).pack(side=tk.LEFT, padx=6)
+        self._btn(bf, "OCR Parameters", self._open_ocr_params).pack(side=tk.LEFT, padx=6)
 
         # ── OCR output ─────────────────────────────
         ocr_lf = self._lf(self, "OCR / Detected cards")
@@ -896,6 +919,140 @@ class PokerGeniusApp(tk.Tk):
         self.hole_entry.delete(0, tk.END)
         self.board_entry.delete(0, tk.END)
         self._set_status("Cleared.")
+    
+    def _open_ocr_params(self):
+        """Open window to configure OCR parameters."""
+        win = tk.Toplevel(self)
+        win.title("OCR Parameters")
+        win.geometry("500x520")
+        win.configure(bg=self.BG)
+        win.transient(self)
+        
+        B, F = self.BG, self.FG
+        
+        tk.Label(win, text="OCR Recognition Parameters", 
+                 bg=B, fg=self.ACC, font=("Helvetica", 14, "bold")).pack(pady=12)
+        
+        # Main content frame
+        content = tk.Frame(win, bg=B)
+        content.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Rotation angles
+        tk.Label(content, text="Rotation Angles (degrees):", 
+                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=0, column=0, sticky=tk.W, pady=(0,4))
+        tk.Label(content, text="Number of angles to test for tilted cards", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=1, column=0, sticky=tk.W, pady=(0,8))
+        
+        angles_frame = tk.Frame(content, bg=B)
+        angles_frame.grid(row=2, column=0, sticky=tk.W, pady=(0,16))
+        
+        tk.Label(angles_frame, text="From:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        angle_min_var = tk.IntVar(value=min(self.ocr_rotation_angles))
+        tk.Spinbox(angles_frame, from_=-15, to=0, width=4, textvariable=angle_min_var,
+                   bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(angles_frame, text="To:", bg=B, fg=F).pack(side=tk.LEFT, padx=(12,4))
+        angle_max_var = tk.IntVar(value=max(self.ocr_rotation_angles))
+        tk.Spinbox(angles_frame, from_=0, to=15, width=4, textvariable=angle_max_var,
+                   bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(angles_frame, text="Step:", bg=B, fg=F).pack(side=tk.LEFT, padx=(12,4))
+        angle_step_var = tk.IntVar(value=5)
+        tk.Spinbox(angles_frame, from_=1, to=10, width=3, textvariable=angle_step_var,
+                   bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
+        
+        # Card orientations
+        tk.Label(content, text="Card Orientations:", 
+                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=3, column=0, sticky=tk.W, pady=(0,4))
+        tk.Label(content, text="Which rotations to test per card region", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=4, column=0, sticky=tk.W, pady=(0,8))
+        
+        orient_frame = tk.Frame(content, bg=B)
+        orient_frame.grid(row=5, column=0, sticky=tk.W, pady=(0,16))
+        
+        orient_vars = {}
+        for angle, label in [(0, "0° (upright)"), (90, "90°"), (180, "180° (inverted)"), (270, "270°")]:
+            var = tk.BooleanVar(value=(angle in self.ocr_orientations))
+            orient_vars[angle] = var
+            tk.Checkbutton(orient_frame, text=label, variable=var, 
+                          bg=B, fg=F, selectcolor=self.BG2, 
+                          activebackground=B, activeforeground=F).pack(anchor=tk.W)
+        
+        # Confidence thresholds
+        tk.Label(content, text="Template Match Thresholds:", 
+                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=6, column=0, sticky=tk.W, pady=(0,4))
+        tk.Label(content, text="Minimum confidence to trust template matching", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=7, column=0, sticky=tk.W, pady=(0,8))
+        
+        thresh_frame = tk.Frame(content, bg=B)
+        thresh_frame.grid(row=8, column=0, sticky=tk.W, pady=(0,16))
+        
+        tk.Label(thresh_frame, text="Rank:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        rank_thresh_var = tk.DoubleVar(value=self.ocr_rank_threshold)
+        tk.Scale(thresh_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=rank_thresh_var, bg=B, fg=F, highlightthickness=0, 
+                troughcolor=self.BG2, length=100).pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(thresh_frame, text="Suit:", bg=B, fg=F).pack(side=tk.LEFT, padx=(12,4))
+        suit_thresh_var = tk.DoubleVar(value=self.ocr_suit_threshold)
+        tk.Scale(thresh_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=suit_thresh_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=100).pack(side=tk.LEFT, padx=2)
+        
+        # Upscale factor
+        tk.Label(content, text="Image Preprocessing:", 
+                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=9, column=0, sticky=tk.W, pady=(0,4))
+        
+        upscale_frame = tk.Frame(content, bg=B)
+        upscale_frame.grid(row=10, column=0, sticky=tk.W, pady=(0,16))
+        
+        tk.Label(upscale_frame, text="Upscale factor:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        upscale_var = tk.IntVar(value=self.ocr_upscale_factor)
+        tk.Spinbox(upscale_frame, from_=1, to=4, width=3, textvariable=upscale_var,
+                   bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
+        tk.Label(upscale_frame, text="×  (higher = slower but more accurate)", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        
+        # Buttons
+        btn_frame = tk.Frame(win, bg=B)
+        btn_frame.pack(pady=12)
+        
+        def apply():
+            # Build rotation angles list
+            min_ang = angle_min_var.get()
+            max_ang = angle_max_var.get()
+            step = angle_step_var.get()
+            if min_ang <= max_ang and step > 0:
+                angles = list(range(min_ang, max_ang + 1, step))
+                if 0 not in angles:
+                    angles.append(0)
+                    angles.sort()
+                self.ocr_rotation_angles = angles
+            
+            # Build orientations list
+            self.ocr_orientations = [ang for ang, var in orient_vars.items() if var.get()]
+            if not self.ocr_orientations:
+                self.ocr_orientations = [0]  # Must have at least one
+            
+            self.ocr_rank_threshold = rank_thresh_var.get()
+            self.ocr_suit_threshold = suit_thresh_var.get()
+            self.ocr_upscale_factor = upscale_var.get()
+            
+            self._set_status(f"OCR params: angles={self.ocr_rotation_angles}, orientations={self.ocr_orientations}")
+            win.destroy()
+        
+        def reset():
+            self.ocr_rotation_angles = [-5, 0, 5]
+            self.ocr_orientations = [0, 180]
+            self.ocr_rank_threshold = 0.35
+            self.ocr_suit_threshold = 0.25
+            self.ocr_upscale_factor = 2
+            self._set_status("OCR parameters reset to defaults")
+            win.destroy()
+        
+        self._btn(btn_frame, "Apply", apply).pack(side=tk.LEFT, padx=6)
+        self._btn(btn_frame, "Reset to Defaults", reset).pack(side=tk.LEFT, padx=6)
+        self._btn(btn_frame, "Cancel", win.destroy).pack(side=tk.LEFT, padx=6)
 
     def _on_capture(self):
         self._set_status("Capturing screen…")
@@ -907,7 +1064,13 @@ class PokerGeniusApp(tk.Tk):
 
     def _capture_worker(self):
         try:
-            raw_text, cards = capture_and_ocr()
+            raw_text, cards = capture_and_ocr(
+                self.ocr_rotation_angles, 
+                self.ocr_orientations,
+                self.ocr_upscale_factor,
+                self.ocr_rank_threshold,
+                self.ocr_suit_threshold
+            )
             self.after(0, lambda: self._display_ocr(raw_text, cards))
             self.after(0, lambda: self._run_analysis(cards))
         except Exception as exc:
