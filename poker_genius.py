@@ -227,8 +227,8 @@ def estimate_red_suit(pil_image: Image.Image) -> bool:
     # Find foreground pixels directly from the original image
     # (assuming symbol is darker than white background)
     gray = np.array(pil_image.convert("L"))
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    mask = binary > 0
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = binary == 0
     
     if not np.any(mask):
         return False
