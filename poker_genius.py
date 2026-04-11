@@ -377,18 +377,22 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
         
-        # Choose best rank: balance template matching and OCR based on confidence
+        # DEBUG decision logic
+        import sys
+        print(f"  [DECISION] rank_match={rank_match!r} rank_score={rank_score} rank_ocr={rank_ocr!r}", file=sys.stderr, flush=True)
+        print(f"  [DECISION] score<=0.40? {rank_score <= 0.40}, both_exist? {bool(rank_ocr and rank_match)}", file=sys.stderr, flush=True)
+        
+        # Choose best rank: require high template confidence to override OCR
         if rank_match and rank_ocr and rank_match == rank_ocr:
             rank = rank_match  # Both agree - definitely correct
-        elif rank_match and rank_score >= rank_threshold:
-            rank = rank_match  # Template is confident enough
-        elif rank_ocr and (not rank_match or rank_score < 0.25):
-            rank = rank_ocr  # OCR has result and template is weak/missing
-        elif rank_ocr and rank_match and rank_score < 0.35:
-            # Template has low-medium confidence but OCR disagrees - trust OCR
-            rank = rank_ocr
+        elif rank_match and rank_score >= 0.45:
+            rank = rank_match  # Template is very confident, trust it
+        elif rank_ocr and rank_match and rank_score <= 0.40:
+            rank = rank_ocr  # Template weak/medium and OCR disagrees - trust OCR
+        elif rank_ocr and not rank_match:
+            rank = rank_ocr  # No template match, use OCR
         elif rank_match:
-            rank = rank_match  # Use template (OCR failed or template more reliable)
+            rank = rank_match  # Use template (OCR failed or template medium confidence)
         else:
             rank = rank_ocr  # Last resort OCR
 
