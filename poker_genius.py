@@ -289,11 +289,11 @@ def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], 
     return Image.fromarray(warped)
 
 
-def find_card_regions(pil_image: Image.Image, white_ratio_threshold: float = 0.15,
-                      aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
-                      fill_ratio_threshold: float = 0.45,
-                      hsv_v_min: int = 80, hsv_v_max: int = 255,
-                      hsv_s_max: int = 90) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int], float]]:
+def find_card_regions(pil_image: Image.Image, white_ratio_threshold: float = 0.24,
+                      aspect_ratio_min: float = 0.45, aspect_ratio_max: float = 0.88,
+                      fill_ratio_threshold: float = 0.38,
+                      hsv_v_min: int = 95, hsv_v_max: int = 255,
+                      hsv_s_max: int = 75) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int], float]]:
     """Locate bright, card-shaped regions and rectify them into portrait card crops. Returns (center, warped_image, bbox, angle)."""
     rgb = np.array(pil_image.convert("RGB"))
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
@@ -357,13 +357,21 @@ def find_card_regions(pil_image: Image.Image, white_ratio_threshold: float = 0.1
 
         rect = cv2.minAreaRect(contour)
         (center_x, center_y), (width, height), angle_deg = rect
-        if min(width, height) < 40:
+        is_bottom_zone = center_y > rgb.shape[0] * 0.58
+
+        # Enforce stronger geometry gates to filter out isolated suit/rank symbols.
+        min_short_side = 55 if is_bottom_zone else 70
+        if min(width, height) < min_short_side:
             rejected_by_size += 1
+            continue
+
+        local_min_area = max(3000, min_area * 1.0) if is_bottom_zone else max(6000, min_area * 1.0)
+        if area < local_min_area:
+            rejected_by_area += 1
             continue
 
         # Hole cards can be partially clipped/covered near the bottom of the table view.
         # In that zone, allow looser shape/coverage checks to keep those candidates.
-        is_bottom_zone = center_y > rgb.shape[0] * 0.58
 
         short_side, long_side = sorted((width, height))
         ratio = short_side / long_side
@@ -611,7 +619,10 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}", file=sys.stderr, flush=True)
 
         if rank and suit:
-            score = rank_score + suit_score
+            # Weight rank more than suit and mildly penalize 180° orientation.
+            # This avoids upside-down matches winning due an oversized suit symbol score.
+            orientation_penalty = 0.20 if orientation == 180 else 0.0
+            score = (rank_score * 1.6) + (suit_score * 0.7) - orientation_penalty
             if score > best_score:
                 best_card = rank + suit
                 best_score = score
@@ -620,21 +631,21 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
                     f"suit={suit}({suit_score:.2f}/{suit_ocr or '-'})"
                 )
                 # Early exit if we have high confidence
-                if score > 1.5:
+                if score > 1.55:
                     break
 
     return best_card, best_score, best_debug
 
 
 def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
-                             rank_threshold: float = 0.35, suit_threshold: float = 0.25,
-                             white_ratio_threshold: float = 0.15,
-                             aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
-                             fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38,
+                             rank_threshold: float = 0.60, suit_threshold: float = 0.20,
+                             white_ratio_threshold: float = 0.24,
+                             aspect_ratio_min: float = 0.45, aspect_ratio_max: float = 0.88,
+                             fill_ratio_threshold: float = 0.38, red_ratio_threshold: float = 0.38,
                              hole_rotation: int = 0, board_rotation: int = 0,
                              card1_rotation: int = 0, card2_rotation: int = 0,
-                             hsv_v_min: int = 80, hsv_v_max: int = 255,
-                             hsv_s_max: int = 90) -> Tuple[List[str], List[str], List[int]]:
+                             hsv_v_min: int = 95, hsv_v_max: int = 255,
+                             hsv_s_max: int = 75) -> Tuple[List[str], List[str], List[int]]:
     """Detect cards from likely card regions using template matching and region-local OCR. Returns (cards, debug_lines, angles)."""
     if orientations is None:
         orientations = [0, 180]
@@ -658,7 +669,48 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
             manual_rotation = int(detected_angle)
             if manual_rotation != 0:
                 print(f"[AUTO-ANGLE] Card {index}: using auto-detected angle {manual_rotation}°", file=sys.stderr, flush=True)
+
+        box_w, box_h = bbox[2], bbox[3]
+        is_bottom_zone = center[1] > (pil_image.height * 0.42)
         
+        # Ignore tiny bottom-zone regions (usually isolated suit/rank symbols, not cards).
+        if is_bottom_zone and box_h < int(pil_image.height * 0.16):
+            debug_lines.append(f"region {index} @ {center}: skipped tiny bottom contour (w={box_w}, h={box_h})")
+            continue
+
+        # If a bottom-zone region is unusually wide, it is often two overlapped/fanned hole cards.
+        # Split it into left/right candidates and run recognition for each side.
+        is_wide_bottom_blob = (
+            is_bottom_zone
+            and box_h >= int(pil_image.height * 0.20)
+            and box_w >= int(box_h * 0.95)
+        )
+        if is_wide_bottom_blob:
+            w, h = card_image.size
+            overlap = int(w * 0.10)
+            mid = w // 2
+            left_crop = card_image.crop((0, 0, min(w, mid + overlap), h))
+            right_crop = card_image.crop((max(0, mid - overlap), 0, w, h))
+
+            # Blob angle can be unstable for fanned hole cards. If it's too steep,
+            # do not apply it to split-side recognition.
+            split_rotation = manual_rotation if abs(manual_rotation) <= 25 else 0
+
+            split_debug = []
+            for side_name, side_img, side_shift in (("L", left_crop, -18), ("R", right_crop, 18)):
+                side_card, side_score, side_info = recognize_card_from_region(
+                    side_img, orientations, rank_threshold, suit_threshold, red_ratio_threshold, split_rotation
+                )
+                # Split results are noisy; require stronger confidence than normal regions.
+                if side_card and side_score >= 1.20:
+                    side_center = (center[0] + side_shift, center[1])
+                    detections.append((side_center, side_card, side_score, bbox, f"[HOLE-SPLIT-{side_name}] {side_info}", split_rotation))
+                    split_debug.append(f"{side_name}:{side_card}@{side_score:.2f}")
+
+            if split_debug:
+                debug_lines.append(f"region {index} @ {center}: split hole-card blob -> {' | '.join(split_debug)}")
+                continue
+
         card, score, debug = recognize_card_from_region(card_image, orientations, rank_threshold, suit_threshold, red_ratio_threshold, manual_rotation)
         if not card:
             debug_lines.append(f"region {index} @ {center}: no card match")
@@ -681,14 +733,14 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
 
 def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None, 
                           orientations: list = None, upscale_factor: int = 2,
-                          rank_threshold: float = 0.35, suit_threshold: float = 0.25,
-                          white_ratio_threshold: float = 0.15,
-                          aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
-                          fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38,
+                          rank_threshold: float = 0.60, suit_threshold: float = 0.20,
+                          white_ratio_threshold: float = 0.24,
+                          aspect_ratio_min: float = 0.45, aspect_ratio_max: float = 0.88,
+                          fill_ratio_threshold: float = 0.38, red_ratio_threshold: float = 0.38,
                           hole_rotation: int = 0, board_rotation: int = 0,
                           card1_rotation: int = 0, card2_rotation: int = 0,
-                          hsv_v_min: int = 80, hsv_v_max: int = 255,
-                         hsv_s_max: int = 90) -> Tuple[str, List[str], List[int]]:
+                          hsv_v_min: int = 95, hsv_v_max: int = 255,
+                         hsv_s_max: int = 75) -> Tuple[str, List[str], List[int]]:
     """Use region detection first, then multi-angle OCR as a fallback and supplement. Returns (raw_text, cards, angles)."""
     if rotation_angles is None:
         rotation_angles = [-5, 0, 5]
@@ -703,9 +755,9 @@ def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None,
     all_cards = list(region_cards)
     all_angles = list(region_angles)
     
-    # Always try full-image OCR if region detection failed or found very few cards
+    # Try full-image OCR unless region detection already found a near-complete set.
     # This handles cases where cards have glows/highlights that break region detection
-    if len(region_cards) >= 2:
+    if len(region_cards) >= 5:
         preview_lines = [f"Region detector found: {', '.join(region_cards)}"]
         preview_lines.extend(region_debug[:8])
         preview_lines.append("Skipped full-image OCR (sufficient cards from regions)")
@@ -777,14 +829,14 @@ def parse_cards_from_text(text: str) -> List[str]:
 
 
 def capture_and_ocr(rotation_angles: list = None, orientations: list = None, 
-                    upscale_factor: int = 2, rank_threshold: float = 0.35, 
-                    suit_threshold: float = 0.25, white_ratio_threshold: float = 0.15,
-                    aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
-                    fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38,
+                    upscale_factor: int = 2, rank_threshold: float = 0.60, 
+                    suit_threshold: float = 0.20, white_ratio_threshold: float = 0.24,
+                    aspect_ratio_min: float = 0.45, aspect_ratio_max: float = 0.88,
+                    fill_ratio_threshold: float = 0.38, red_ratio_threshold: float = 0.38,
                     hole_rotation: int = 0, board_rotation: int = 0,
                     card1_rotation: int = 0, card2_rotation: int = 0,
-                    hsv_v_min: int = 80, hsv_v_max: int = 255,
-                    hsv_s_max: int = 90,
+                    hsv_v_min: int = 95, hsv_v_max: int = 255,
+                    hsv_s_max: int = 75,
                     bbox: tuple = None) -> Tuple[str, List[str], List[int]]:
     """Capture screen region (or full screen), OCR multiple tilt angles, and return the best text plus merged cards."""
     import sys
@@ -1132,19 +1184,19 @@ class PokerGeniusApp(tk.Tk):
         self.ocr_rotation_angles = [-5, 0, 5]
         self.ocr_angle_step = 5
         self.ocr_orientations = [0, 180]
-        self.ocr_rank_threshold = 0.70  # Higher threshold = trust OCR more (template must be very confident to override)
-        self.ocr_suit_threshold = 0.15  # Lower threshold for suits
+        self.ocr_rank_threshold = 0.60  # Balanced OCR/template blending
+        self.ocr_suit_threshold = 0.20  # Slightly stricter than rank for symbol stability
         self.ocr_upscale_factor = 2
         
         # Card region detection thresholds
-        self.white_ratio_threshold = 0.30  # Minimum white/bright ratio for card region detection (stricter: was 0.15)
-        self.aspect_ratio_min = 0.50  # Minimum aspect ratio (short/long side) for card shape
-        self.aspect_ratio_max = 0.82  # Maximum aspect ratio (short/long side) for card shape
-        self.fill_ratio_threshold = 0.45  # Minimum fill ratio (area/bounding_box) for card shape
+        self.white_ratio_threshold = 0.24  # Balanced for white board cards + partially visible hole cards
+        self.aspect_ratio_min = 0.45  # Minimum aspect ratio (short/long side) for card shape
+        self.aspect_ratio_max = 0.88  # Maximum aspect ratio (short/long side) for card shape
+        self.fill_ratio_threshold = 0.38  # Minimum fill ratio (area/bounding_box) for card shape
         self.red_ratio_threshold = 0.38  # Red channel ratio to classify suit as red
-        self.hsv_v_min = 110  # HSV brightness (V channel) minimum threshold for card detection (stricter: was 80)
+        self.hsv_v_min = 95  # HSV brightness (V channel) minimum threshold for card detection
         self.hsv_v_max = 255  # HSV brightness (V channel) maximum threshold for card detection
-        self.hsv_s_max = 60  # HSV saturation (S channel) maximum threshold for white-ish card surfaces (stricter: was 90)
+        self.hsv_s_max = 75  # HSV saturation (S channel) maximum threshold for white-ish card surfaces
         
         # Manual rotation angles for card correction
         self.hole_card_rotation = 0  # Rotation angle for hole cards (degrees)
@@ -1599,17 +1651,17 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rotation_angles = [-5, 0, 5]
             self.ocr_angle_step = 5
             self.ocr_orientations = [0, 180]
-            self.ocr_rank_threshold = 0.70
-            self.ocr_suit_threshold = 0.15
+            self.ocr_rank_threshold = 0.60
+            self.ocr_suit_threshold = 0.20
             self.ocr_upscale_factor = 2
-            self.white_ratio_threshold = 0.30  # Updated to stricter default
-            self.aspect_ratio_min = 0.50
-            self.aspect_ratio_max = 0.82
-            self.fill_ratio_threshold = 0.45
+            self.white_ratio_threshold = 0.24
+            self.aspect_ratio_min = 0.45
+            self.aspect_ratio_max = 0.88
+            self.fill_ratio_threshold = 0.38
             self.red_ratio_threshold = 0.38
-            self.hsv_v_min = 110  # Updated to stricter default
+            self.hsv_v_min = 95
             self.hsv_v_max = 255
-            self.hsv_s_max = 60  # Updated to stricter default
+            self.hsv_s_max = 75
             self._set_status("OCR parameters reset to defaults")
             self.preview_refresh_callback = None
             canvas.unbind_all("<MouseWheel>")
