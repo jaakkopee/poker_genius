@@ -44,8 +44,9 @@ CARD_ORIENTATIONS = (0, 180)
 TEMPLATE_CONFIDENCE_THRESHOLD = 0.50
 CARD_CANVAS = (180, 252)
 SYMBOL_TEMPLATE_SIZE = (64, 64)
-CARD_MASK_LOW = np.array([0, 0, 140], dtype=np.uint8)
-CARD_MASK_HIGH = np.array([180, 105, 255], dtype=np.uint8)
+# Very permissive HSV mask - primarily brightness-based to catch cards with any colored glow/highlight
+CARD_MASK_LOW = np.array([0, 0, 100], dtype=np.uint8)
+CARD_MASK_HIGH = np.array([180, 255, 255], dtype=np.uint8)
 SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
 RED_SUITS = {"d", "h"}
 BLACK_SUITS = {"c", "s"}
@@ -232,7 +233,7 @@ def normalize_suit_symbol(text: str) -> Optional[str]:
     return None
 
 
-def estimate_red_suit(pil_image: Image.Image) -> bool:
+def estimate_red_suit(pil_image: Image.Image, red_ratio_threshold: float = 0.38) -> bool:
     """Estimate whether the symbol is red or black from the original crop."""
     rgb = np.array(pil_image.convert("RGB"))
     
@@ -267,7 +268,7 @@ def estimate_red_suit(pil_image: Image.Image) -> bool:
     
     # For medium-dark colors, check red ratio
     red_ratio = avg_r / (avg_r + avg_g + avg_b + 1e-6)
-    return red_ratio > 0.38  # Red channel is > 38% of total
+    return red_ratio > red_ratio_threshold
 
 
 def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], Tuple[float, float], float]) -> Image.Image:
@@ -287,7 +288,9 @@ def rectify_card_region(rgb_image: np.ndarray, rect: Tuple[Tuple[float, float], 
     return Image.fromarray(warped)
 
 
-def find_card_regions(pil_image: Image.Image) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int]]]:
+def find_card_regions(pil_image: Image.Image, white_ratio_threshold: float = 0.15,
+                      aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
+                      fill_ratio_threshold: float = 0.45) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int]]]:
     """Locate bright, card-shaped regions and rectify them into portrait card crops."""
     rgb = np.array(pil_image.convert("RGB"))
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
@@ -295,35 +298,65 @@ def find_card_regions(pil_image: Image.Image) -> List[Tuple[Tuple[int, int], Ima
     kernel = np.ones((7, 7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    
+    # DEBUG: Save mask and input image
+    import os
+    import sys
+    debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
+    os.makedirs(debug_dir, exist_ok=True)
+    Image.fromarray(rgb).save(f"{debug_dir}/00_input_image.png")
+    Image.fromarray(mask).save(f"{debug_dir}/01_hsv_mask.png")
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     image_area = rgb.shape[0] * rgb.shape[1]
     min_area = max(2500, image_area * 0.001)
     max_area = image_area * 0.08
     candidates = []
+    
+    # Debug counters
+    rejected_by_area = 0
+    rejected_by_size = 0
+    rejected_by_ratio = 0
+    rejected_by_white = 0
+    print(f"[REGION-DETECT] Found {len(contours)} contours, white_ratio_threshold={white_ratio_threshold:.2f}", file=sys.stderr, flush=True)
 
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < min_area or area > max_area:
+            rejected_by_area += 1
             continue
 
         rect = cv2.minAreaRect(contour)
         (center_x, center_y), (width, height), _ = rect
         if min(width, height) < 40:
+            rejected_by_size += 1
             continue
 
         short_side, long_side = sorted((width, height))
         ratio = short_side / long_side
         fill_ratio = area / max(width * height, 1)
-        if not (0.50 <= ratio <= 0.82 and fill_ratio >= 0.45):
+        if not (aspect_ratio_min <= ratio <= aspect_ratio_max and fill_ratio >= fill_ratio_threshold):
+            rejected_by_ratio += 1
             continue
 
         x, y, box_w, box_h = cv2.boundingRect(contour)
         warped = rectify_card_region(rgb, rect)
         warped_hsv = cv2.cvtColor(np.array(warped.convert("RGB")), cv2.COLOR_RGB2HSV)
         white_ratio = float((cv2.inRange(warped_hsv, CARD_MASK_LOW, CARD_MASK_HIGH) > 0).mean())
-        if white_ratio < 0.55:
+        # Check if enough of the card is bright/white to be valid
+        if white_ratio < white_ratio_threshold:
+            rejected_by_white += 1
+            print(f"[REGION-REJECT] Rejected region at ({int(center_x)},{int(center_y)}): white_ratio={white_ratio:.2f} < threshold={white_ratio_threshold:.2f}", file=sys.stderr, flush=True)
             continue
+        
+        # DEBUG: Save accepted warped regions
+        import os
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
+        os.makedirs(debug_dir, exist_ok=True)
+        region_num = len(candidates) + 1
+        warped.save(f"{debug_dir}/region_{region_num}_warped_at_{int(center_x)}_{int(center_y)}.png")
+        print(f"[REGION-ACCEPT] Region #{region_num} at ({int(center_x)},{int(center_y)}): white_ratio={white_ratio:.2f}, saved to debug_crops/", file=sys.stderr, flush=True)
+        
         candidates.append(((int(center_x), int(center_y)), warped, (x, y, box_w, box_h), area))
 
     candidates.sort(key=lambda item: item[3], reverse=True)
@@ -334,6 +367,10 @@ def find_card_regions(pil_image: Image.Image) -> List[Tuple[Tuple[int, int], Ima
         deduped.append((center, warped, bbox, area))
 
     deduped.sort(key=lambda item: (item[0][1], item[0][0]))
+    
+    # Debug summary
+    print(f"[REGION-SUMMARY] Rejected: area={rejected_by_area}, size={rejected_by_size}, ratio={rejected_by_ratio}, white={rejected_by_white} | Accepted: {len(deduped)}", file=sys.stderr, flush=True)
+    
     return [(center, warped, bbox) for center, warped, bbox, _ in deduped]
 
 
@@ -345,7 +382,8 @@ def rotate_for_ocr(pil_image: Image.Image, angle: int) -> Image.Image:
 
 
 def recognize_card_from_region(card_image: Image.Image, orientations: list = None, 
-                                 rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[Optional[str], float, str]:
+                                 rank_threshold: float = 0.35, suit_threshold: float = 0.25,
+                                 red_ratio_threshold: float = 0.38) -> Tuple[Optional[str], float, str]:
     """Recognize a card from a rectified crop using template matching with OCR fallback."""
     if orientations is None:
         orientations = [0, 180]
@@ -359,19 +397,20 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
         oriented = oriented.resize(CARD_CANVAS, Image.LANCZOS)
 
-        # Extract rank and suit directly from card - generous crop to avoid cutting off symbols
-        # Rank is in upper-left, suit is below it
-        rank_crop = oriented.crop((5, 5, int(oriented.width * 0.5), int(oriented.height * 0.25)))
-        suit_crop = oriented.crop((5, int(oriented.height * 0.20), int(oriented.width * 0.5), int(oriented.height * 0.50)))
+        # Extract rank and suit from top-left corner with maximum capture area
+        # Cards are 180x252 after resize - take generous 40% width x 40% height for both
+        rank_crop = oriented.crop((0, 0, int(oriented.width * 0.40), int(oriented.height * 0.30)))
+        suit_crop = oriented.crop((0, int(oriented.height * 0.15), int(oriented.width * 0.40), int(oriented.height * 0.50)))
         
         # DEBUG: Save crops for inspection
         import os
         import sys
         debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
         os.makedirs(debug_dir, exist_ok=True)
+        oriented.save(f"{debug_dir}/card_full_{orientation}.png")
         rank_crop.save(f"{debug_dir}/rank_{orientation}.png")
         suit_crop.save(f"{debug_dir}/suit_{orientation}.png")
-        print(f"  Saved debug crops to {debug_dir}/rank_{orientation}.png", file=sys.stderr, flush=True)
+        print(f"  Saved debug crops to {debug_dir}/ (card_full, rank, suit @ {orientation}°)", file=sys.stderr, flush=True)
 
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
         rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
@@ -381,21 +420,19 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         print(f"  [DECISION] rank_match={rank_match!r} rank_score={rank_score} rank_ocr={rank_ocr!r}", file=sys.stderr, flush=True)
         print(f"  [DECISION] score<=0.40? {rank_score <= 0.40}, both_exist? {bool(rank_ocr and rank_match)}", file=sys.stderr, flush=True)
         
-        # Choose best rank: require high template confidence to override OCR
+        # Choose best rank: require very high template confidence to override OCR
         if rank_match and rank_ocr and rank_match == rank_ocr:
             rank = rank_match  # Both agree - definitely correct
-        elif rank_match and rank_score >= 0.45:
-            rank = rank_match  # Template is very confident, trust it
-        elif rank_ocr and rank_match and rank_score <= 0.40:
-            rank = rank_ocr  # Template weak/medium and OCR disagrees - trust OCR
-        elif rank_ocr and not rank_match:
-            rank = rank_ocr  # No template match, use OCR
+        elif rank_match and rank_score >= rank_threshold:
+            rank = rank_match  # Template is confident enough, trust it
+        elif rank_ocr:
+            rank = rank_ocr  # OCR has a result - trust it (template not confident enough or disagrees)
         elif rank_match:
-            rank = rank_match  # Use template (OCR failed or template medium confidence)
+            rank = rank_match  # No OCR, use template
         else:
             rank = rank_ocr  # Last resort OCR
 
-        allowed_suits = RED_SUITS if estimate_red_suit(suit_crop) else BLACK_SUITS
+        allowed_suits = RED_SUITS if estimate_red_suit(suit_crop, red_ratio_threshold) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits, debug_label=f"SUIT@{orientation}° allowed={allowed_suits}")
         suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
         
@@ -404,7 +441,7 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             suit = suit_match  # Both agree and in allowed set
         elif suit_match and suit_score >= suit_threshold and suit_match in allowed_suits:
             suit = suit_match  # Template is confident
-        elif suit_match and suit_match in allowed_suits and suit_score >= 0.1:
+        elif suit_match and suit_match in allowed_suits and suit_score >= (suit_threshold * 0.4):
             suit = suit_match  # Template has some confidence in allowed suit
         elif suit_ocr and suit_ocr in allowed_suits:
             suit = suit_ocr  # OCR result in allowed set
@@ -434,7 +471,10 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
 
 
 def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
-                             rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[List[str], List[str]]:
+                             rank_threshold: float = 0.35, suit_threshold: float = 0.25,
+                             white_ratio_threshold: float = 0.15,
+                             aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
+                             fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38) -> Tuple[List[str], List[str]]:
     """Detect cards from likely card regions using template matching and region-local OCR."""
     if orientations is None:
         orientations = [0, 180]
@@ -442,8 +482,10 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
     debug_lines = []
     detections = []
 
-    for index, (center, card_image, bbox) in enumerate(find_card_regions(pil_image), start=1):
-        card, score, debug = recognize_card_from_region(card_image)
+    for index, (center, card_image, bbox) in enumerate(
+        find_card_regions(pil_image, white_ratio_threshold, aspect_ratio_min, aspect_ratio_max, fill_ratio_threshold), 
+        start=1):
+        card, score, debug = recognize_card_from_region(card_image, orientations, rank_threshold, suit_threshold, red_ratio_threshold)
         if not card:
             debug_lines.append(f"region {index} @ {center}: no card match")
             continue
@@ -464,17 +506,23 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
 
 def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None, 
                           orientations: list = None, upscale_factor: int = 2,
-                          rank_threshold: float = 0.35, suit_threshold: float = 0.25) -> Tuple[str, List[str]]:
+                          rank_threshold: float = 0.35, suit_threshold: float = 0.25,
+                          white_ratio_threshold: float = 0.15,
+                          aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
+                          fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38) -> Tuple[str, List[str]]:
     """Use region detection first, then multi-angle OCR as a fallback and supplement."""
     if rotation_angles is None:
         rotation_angles = [-5, 0, 5]
     if orientations is None:
         orientations = [0, 180]
     
-    region_cards, region_debug = detect_cards_by_regions(pil_image, orientations, rank_threshold, suit_threshold)
+    region_cards, region_debug = detect_cards_by_regions(pil_image, orientations, rank_threshold, suit_threshold, 
+                                                          white_ratio_threshold, aspect_ratio_min, aspect_ratio_max,
+                                                          fill_ratio_threshold, red_ratio_threshold)
     all_cards = list(region_cards)
     
-    # Skip expensive full-image OCR if region detection found enough cards
+    # Always try full-image OCR if region detection failed or found very few cards
+    # This handles cases where cards have glows/highlights that break region detection
     if len(region_cards) >= 2:
         preview_lines = [f"Region detector found: {', '.join(region_cards)}"]
         preview_lines.extend(region_debug[:8])
@@ -490,6 +538,9 @@ def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None,
         rotated = rotate_for_ocr(pil_image, angle)
         processed = preprocess_for_ocr(rotated, upscale_factor)
         text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
+        # DEBUG: Show what OCR actually read
+        import sys
+        print(f"  [FULL-OCR@{angle}°] Raw text: {text.strip()!r}", file=sys.stderr, flush=True)
         cards = parse_cards_from_text(text)
 
         for card in cards:
@@ -537,11 +588,15 @@ def parse_cards_from_text(text: str) -> List[str]:
 
 def capture_and_ocr(rotation_angles: list = None, orientations: list = None, 
                     upscale_factor: int = 2, rank_threshold: float = 0.35, 
-                    suit_threshold: float = 0.25, bbox: tuple = None) -> Tuple[str, List[str]]:
+                    suit_threshold: float = 0.25, white_ratio_threshold: float = 0.15,
+                    aspect_ratio_min: float = 0.50, aspect_ratio_max: float = 0.82,
+                    fill_ratio_threshold: float = 0.45, red_ratio_threshold: float = 0.38,
+                    bbox: tuple = None) -> Tuple[str, List[str]]:
     """Capture screen region (or full screen), OCR multiple tilt angles, and return the best text plus merged cards."""
     screenshot = ImageGrab.grab(bbox=bbox)
     return ocr_cards_from_image(screenshot, rotation_angles, orientations, upscale_factor, 
-                                 rank_threshold, suit_threshold)
+                                 rank_threshold, suit_threshold, white_ratio_threshold,
+                                 aspect_ratio_min, aspect_ratio_max, fill_ratio_threshold, red_ratio_threshold)
 
 
 # ──────────────────────────────────────────────
@@ -849,9 +904,16 @@ class PokerGeniusApp(tk.Tk):
         self.ocr_rotation_angles = [-5, 0, 5]
         self.ocr_angle_step = 5
         self.ocr_orientations = [0, 180]
-        self.ocr_rank_threshold = 0.20  # Lower threshold to trust template matching more
+        self.ocr_rank_threshold = 0.70  # Higher threshold = trust OCR more (template must be very confident to override)
         self.ocr_suit_threshold = 0.15  # Lower threshold for suits
         self.ocr_upscale_factor = 2
+        
+        # Card region detection thresholds
+        self.white_ratio_threshold = 0.15  # Minimum white/bright ratio for card region detection
+        self.aspect_ratio_min = 0.50  # Minimum aspect ratio (short/long side) for card shape
+        self.aspect_ratio_max = 0.82  # Maximum aspect ratio (short/long side) for card shape
+        self.fill_ratio_threshold = 0.45  # Minimum fill ratio (area/bounding_box) for card shape
+        self.red_ratio_threshold = 0.38  # Red channel ratio to classify suit as red
         
         # Screen capture region (None = full screen)
         self.capture_bbox = None
@@ -982,7 +1044,7 @@ class PokerGeniusApp(tk.Tk):
         """Open window to configure OCR parameters."""
         win = tk.Toplevel(self)
         win.title("OCR Parameters")
-        win.geometry("500x600")
+        win.geometry("650x850")
         win.configure(bg=self.BG)
         win.transient(self)
         
@@ -1039,7 +1101,7 @@ class PokerGeniusApp(tk.Tk):
         # Confidence thresholds
         tk.Label(content, text="Template Match Thresholds:", 
                  bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=6, column=0, sticky=tk.W, pady=(0,4))
-        tk.Label(content, text="Minimum confidence to trust template matching", 
+        tk.Label(content, text="Higher = trust OCR more (template needs higher confidence to override)", 
                  bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=7, column=0, sticky=tk.W, pady=(0,8))
         
         thresh_frame = tk.Frame(content, bg=B)
@@ -1062,13 +1124,69 @@ class PokerGeniusApp(tk.Tk):
                  bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=9, column=0, sticky=tk.W, pady=(0,4))
         
         upscale_frame = tk.Frame(content, bg=B)
-        upscale_frame.grid(row=10, column=0, sticky=tk.W, pady=(0,16))
+        upscale_frame.grid(row=10, column=0, sticky=tk.W, pady=(0,8))
         
         tk.Label(upscale_frame, text="Upscale factor:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         upscale_var = tk.IntVar(value=self.ocr_upscale_factor)
         tk.Spinbox(upscale_frame, from_=1, to=4, width=3, textvariable=upscale_var,
                    bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
         tk.Label(upscale_frame, text="×  (higher = slower but more accurate)", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        
+        # White ratio threshold
+        tk.Label(content, text="Card Detection:", 
+                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=11, column=0, sticky=tk.W, pady=(8,4))
+        
+        white_ratio_frame = tk.Frame(content, bg=B)
+        white_ratio_frame.grid(row=12, column=0, sticky=tk.W, pady=(0,16))
+        
+        tk.Label(white_ratio_frame, text="White ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        white_ratio_var = tk.DoubleVar(value=self.white_ratio_threshold)
+        tk.Scale(white_ratio_frame, from_=0.0, to=1.0, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=white_ratio_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=150).pack(side=tk.LEFT, padx=2)
+        tk.Label(white_ratio_frame, text="(lower = detect darker/colored cards)", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        
+        # Aspect ratio thresholds
+        aspect_frame = tk.Frame(content, bg=B)
+        aspect_frame.grid(row=13, column=0, sticky=tk.W, pady=(0,8))
+        
+        tk.Label(aspect_frame, text="Aspect ratio:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        aspect_min_var = tk.DoubleVar(value=self.aspect_ratio_min)
+        tk.Scale(aspect_frame, from_=0.3, to=0.9, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=aspect_min_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=100).pack(side=tk.LEFT, padx=2)
+        tk.Label(aspect_frame, text="to", bg=B, fg=F).pack(side=tk.LEFT, padx=4)
+        aspect_max_var = tk.DoubleVar(value=self.aspect_ratio_max)
+        tk.Scale(aspect_frame, from_=0.5, to=1.0, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=aspect_max_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=100).pack(side=tk.LEFT, padx=2)
+        tk.Label(aspect_frame, text="(short/long)", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        
+        # Fill ratio threshold
+        fill_ratio_frame = tk.Frame(content, bg=B)
+        fill_ratio_frame.grid(row=14, column=0, sticky=tk.W, pady=(0,8))
+        
+        tk.Label(fill_ratio_frame, text="Fill ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        fill_ratio_var = tk.DoubleVar(value=self.fill_ratio_threshold)
+        tk.Scale(fill_ratio_frame, from_=0.1, to=0.9, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=fill_ratio_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=150).pack(side=tk.LEFT, padx=2)
+        tk.Label(fill_ratio_frame, text="(area/bounding_box)", 
+                 bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+        
+        # Red ratio threshold
+        red_ratio_frame = tk.Frame(content, bg=B)
+        red_ratio_frame.grid(row=15, column=0, sticky=tk.W, pady=(0,16))
+        
+        tk.Label(red_ratio_frame, text="Red ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
+        red_ratio_var = tk.DoubleVar(value=self.red_ratio_threshold)
+        tk.Scale(red_ratio_frame, from_=0.2, to=0.6, resolution=0.05, orient=tk.HORIZONTAL,
+                variable=red_ratio_var, bg=B, fg=F, highlightthickness=0,
+                troughcolor=self.BG2, length=150).pack(side=tk.LEFT, padx=2)
+        tk.Label(red_ratio_frame, text="(hearts/diamonds detection)", 
                  bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
         
         # Buttons
@@ -1096,6 +1214,11 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rank_threshold = rank_thresh_var.get()
             self.ocr_suit_threshold = suit_thresh_var.get()
             self.ocr_upscale_factor = upscale_var.get()
+            self.white_ratio_threshold = white_ratio_var.get()
+            self.aspect_ratio_min = aspect_min_var.get()
+            self.aspect_ratio_max = aspect_max_var.get()
+            self.fill_ratio_threshold = fill_ratio_var.get()
+            self.red_ratio_threshold = red_ratio_var.get()
             
             self._set_status(f"OCR params: angles={self.ocr_rotation_angles}, orientations={self.ocr_orientations}")
             win.destroy()
@@ -1104,9 +1227,14 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rotation_angles = [-5, 0, 5]
             self.ocr_angle_step = 5
             self.ocr_orientations = [0, 180]
-            self.ocr_rank_threshold = 0.20
+            self.ocr_rank_threshold = 0.70
             self.ocr_suit_threshold = 0.15
             self.ocr_upscale_factor = 2
+            self.white_ratio_threshold = 0.15
+            self.aspect_ratio_min = 0.50
+            self.aspect_ratio_max = 0.82
+            self.fill_ratio_threshold = 0.45
+            self.red_ratio_threshold = 0.38
             self._set_status("OCR parameters reset to defaults")
             win.destroy()
         
@@ -1169,10 +1297,13 @@ class PokerGeniusApp(tk.Tk):
                                        outline='red', width=5, fill='')
         
         # Instructions with semi-transparent background
-        text_bg = canvas.create_rectangle(0, 0, screen_w, 60, fill='black', stipple='gray50')
+        text_bg = canvas.create_rectangle(0, 0, screen_w, 80, fill='black', stipple='gray50')
         info_text = canvas.create_text(screen_w // 2, 30,
-                                       text="Drag to move | Drag corners/edges to resize | ENTER to confirm | ESC to cancel | DELETE to reset",
+                                       text="Drag to move/resize | F = fullscreen | ENTER = confirm | ESC = cancel | DELETE = reset",
                                        fill='yellow', font=('Helvetica', 14, 'bold'))
+        coords_text = canvas.create_text(screen_w // 2, 60,
+                                         text=f"Selection: {int(rect_w * scale_x)}x{int(rect_h * scale_y)} pixels (native resolution)",
+                                         fill='white', font=('Helvetica', 12))
         
         # State for dragging
         drag_data = {'item': None, 'x': 0, 'y': 0, 'mode': None}
@@ -1226,25 +1357,61 @@ class PokerGeniusApp(tk.Tk):
             
             mode = drag_data['mode']
             
+            # Calculate new coordinates based on mode
             if mode == 'move':
                 # Move entire rectangle
-                canvas.coords(rect, x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+                new_x1, new_y1, new_x2, new_y2 = x1 + dx, y1 + dy, x2 + dx, y2 + dy
             elif mode == 'nw':
-                canvas.coords(rect, x1 + dx, y1 + dy, x2, y2)
+                new_x1, new_y1, new_x2, new_y2 = x1 + dx, y1 + dy, x2, y2
             elif mode == 'ne':
-                canvas.coords(rect, x1, y1 + dy, x2 + dx, y2)
+                new_x1, new_y1, new_x2, new_y2 = x1, y1 + dy, x2 + dx, y2
             elif mode == 'sw':
-                canvas.coords(rect, x1 + dx, y1, x2, y2 + dy)
+                new_x1, new_y1, new_x2, new_y2 = x1 + dx, y1, x2, y2 + dy
             elif mode == 'se':
-                canvas.coords(rect, x1, y1, x2 + dx, y2 + dy)
+                new_x1, new_y1, new_x2, new_y2 = x1, y1, x2 + dx, y2 + dy
             elif mode == 'n':
-                canvas.coords(rect, x1, y1 + dy, x2, y2)
+                new_x1, new_y1, new_x2, new_y2 = x1, y1 + dy, x2, y2
             elif mode == 's':
-                canvas.coords(rect, x1, y1, x2, y2 + dy)
+                new_x1, new_y1, new_x2, new_y2 = x1, y1, x2, y2 + dy
             elif mode == 'w':
-                canvas.coords(rect, x1 + dx, y1, x2, y2)
+                new_x1, new_y1, new_x2, new_y2 = x1 + dx, y1, x2, y2
             elif mode == 'e':
-                canvas.coords(rect, x1, y1, x2 + dx, y2)
+                new_x1, new_y1, new_x2, new_y2 = x1, y1, x2 + dx, y2
+            else:
+                return
+            
+            # Clamp to screen bounds (allow full screen selection)
+            if mode == 'move':
+                # Special handling for move: keep rectangle together
+                width = new_x2 - new_x1
+                height = new_y2 - new_y1
+                # Ensure rectangle stays fully on screen
+                if new_x1 < 0:
+                    new_x1 = 0
+                    new_x2 = width
+                if new_x2 > screen_w:
+                    new_x2 = screen_w
+                    new_x1 = screen_w - width
+                if new_y1 < 0:
+                    new_y1 = 0
+                    new_y2 = height
+                if new_y2 > screen_h:
+                    new_y2 = screen_h
+                    new_y1 = screen_h - height
+            else:
+                # For resize operations: allow coordinates to swap and clamp independently
+                new_x1 = max(0, min(screen_w, new_x1))
+                new_y1 = max(0, min(screen_h, new_y1))
+                new_x2 = max(0, min(screen_w, new_x2))
+                new_y2 = max(0, min(screen_h, new_y2))
+            
+            # Ensure minimum size of 50x50
+            if abs(new_x2 - new_x1) >= 50 and abs(new_y2 - new_y1) >= 50:
+                canvas.coords(rect, new_x1, new_y1, new_x2, new_y2)
+                # Update coordinates display
+                w = int(abs(new_x2 - new_x1) * scale_x)
+                h = int(abs(new_y2 - new_y1) * scale_y)
+                canvas.itemconfig(coords_text, text=f"Selection: {w}x{h} pixels (native resolution)")
             
             drag_data['x'] = event.x
             drag_data['y'] = event.y
@@ -1294,12 +1461,22 @@ class PokerGeniusApp(tk.Tk):
             overlay.destroy()
             self.deiconify()
         
+        def maximize_selection(event=None):
+            """Expand selection to full screen."""
+            canvas.coords(rect, 0, 0, screen_w, screen_h)
+            w = int(screen_w * scale_x)
+            h = int(screen_h * scale_y)
+            canvas.itemconfig(coords_text, text=f"Selection: {w}x{h} pixels (FULL SCREEN)")
+        
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_drag)
         canvas.bind('<Motion>', on_motion)
         overlay.bind('<Return>', confirm)
         overlay.bind('<Escape>', cancel)
         overlay.bind('<Delete>', reset_area)
+        overlay.bind('<BackSpace>', reset_area)
+        overlay.bind('f', maximize_selection)
+        overlay.bind('F', maximize_selection)
         overlay.bind('<BackSpace>', reset_area)
         overlay.focus_set()
 
@@ -1319,6 +1496,11 @@ class PokerGeniusApp(tk.Tk):
                 self.ocr_upscale_factor,
                 self.ocr_rank_threshold,
                 self.ocr_suit_threshold,
+                self.white_ratio_threshold,
+                self.aspect_ratio_min,
+                self.aspect_ratio_max,
+                self.fill_ratio_threshold,
+                self.red_ratio_threshold,
                 self.capture_bbox
             )
             self.after(0, lambda: self._display_ocr(raw_text, cards))
