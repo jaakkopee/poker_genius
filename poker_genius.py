@@ -359,11 +359,10 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
         oriented = oriented.resize(CARD_CANVAS, Image.LANCZOS)
 
-        # Extract larger corner area to avoid cutting off symbols  
-        corner = oriented.crop((0, 0, int(oriented.width * 0.45), int(oriented.height * 0.38)))
-        # Extract rank and suit with more generous margins
-        rank_crop = corner.crop((0, 0, int(corner.width * 0.75), int(corner.height * 0.55)))
-        suit_crop = corner.crop((0, int(corner.height * 0.32), int(corner.width * 0.85), corner.height))
+        # Extract rank and suit directly from card - generous crop to avoid cutting off symbols
+        # Rank is in upper-left, suit is below it
+        rank_crop = oriented.crop((5, 5, int(oriented.width * 0.5), int(oriented.height * 0.25)))
+        suit_crop = oriented.crop((5, int(oriented.height * 0.20), int(oriented.width * 0.5), int(oriented.height * 0.50)))
         
         # DEBUG: Save crops for inspection
         import os
