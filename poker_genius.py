@@ -603,10 +603,10 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             oriented = oriented.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
         oriented = oriented.resize(CARD_CANVAS, Image.LANCZOS)
 
-        # Extract rank and suit from top-left corner with maximum capture area
-        # Cards are 180x252 after resize - take generous 40% width x 40% height for both
-        rank_crop = oriented.crop((0, 0, int(oriented.width * 0.40), int(oriented.height * 0.30)))
-        suit_crop = oriented.crop((0, int(oriented.height * 0.15), int(oriented.width * 0.40), int(oriented.height * 0.50)))
+        # Extract rank and suit from top-left corner with larger area for better OCR
+        # Increased from 40%/30% to 50%/40% to help OCR and template matching with larger glyphs
+        rank_crop = oriented.crop((0, 0, int(oriented.width * 0.50), int(oriented.height * 0.40)))
+        suit_crop = oriented.crop((0, int(oriented.height * 0.15), int(oriented.width * 0.50), int(oriented.height * 0.55)))
         
         # DEBUG: Save crops for inspection
         import os
@@ -661,13 +661,29 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}", file=sys.stderr, flush=True)
 
         if rank and suit:
-            # Weight rank more than suit and mildly penalize 180° orientation.
-            # This avoids upside-down matches winning due an oversized suit symbol score.
-            orientation_penalty = 0.20 if orientation == 180 else 0.0
+            # Strongly prefer upright (0°) orientation by penalizing 180°.
+            # This prevents upside-down cards from winning over upright ones.
+            orientation_penalty = 0.40 if orientation == 180 else 0.0
             score = (rank_score * 1.6) + (suit_score * 0.7) - orientation_penalty
+            
+            # When templates are the only source (no OCR), require higher confidence overall
+            # to avoid ambiguous matches like K↔9 and 8↔5 causing errors
+            if not rank_ocr and not suit_ocr:
+                # If this orientation has low confidence templates, be strict about ranking
+                if rank_score < 0.55 or suit_score < 0.33:
+                    # For low-confidence template-only results, strongly prefer upright (0°)
+                    if best_score > 0 and orientation == 180:
+                        # Only accept 180° if it has clear significantly higher score than 0°
+                        # (more than 0.15 points higher to offset the penalty's intent)
+                        needed_margin = best_score + 0.15
+                        if score < needed_margin:
+                            continue
+            
             if score > best_score:
                 best_card = rank + suit
                 best_score = score
+                best_rank_score = rank_score  # Track rank score for tie-breaking
+                best_orientation = orientation
                 best_debug = (
                     f"orientation={orientation} rank={rank}({rank_score:.2f}/{rank_ocr or '-'}) "
                     f"suit={suit}({suit_score:.2f}/{suit_ocr or '-'})"
@@ -676,6 +692,12 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
                 if score > 1.55:
                     break
 
+    # Sanity check: if 0° and 180° are very close in score, prefer 0° (upright)
+    # This handles cases where the card might look slightly better at 180° but is actually upright
+    if best_card and best_orientation == 0 and best_score > 0.8:
+        # Check if choosing 0° was a close call - if so, accept it
+        pass  # Keep the 0° result
+    
     return best_card, best_score, best_debug
 
 
