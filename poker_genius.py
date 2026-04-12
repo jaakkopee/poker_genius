@@ -12,6 +12,10 @@ from itertools import combinations
 from typing import Optional, List, Tuple
 
 import pytesseract
+try:
+    import easyocr
+except Exception:
+    easyocr = None
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab, ImageTk
 import cv2
 import numpy as np
@@ -41,6 +45,7 @@ SUIT_ALIASES = {
 RANK_VALUES = {r: i for i, r in enumerate(RANKS)}
 OCR_ROTATION_ANGLES = (-5, 0, 5)
 OCR_CONFIG = "--psm 11"
+OCR_ENGINES = ("pytesseract", "easyocr")
 CARD_ORIENTATIONS = (0, 180)
 TEMPLATE_CONFIDENCE_THRESHOLD = 0.50
 CARD_CANVAS = (180, 252)
@@ -213,6 +218,42 @@ def ocr_single_symbol(pil_image: Image.Image, whitelist: str) -> str:
         ocr_image,
         config=f"--psm 10 -c tessedit_char_whitelist={whitelist}",
     ).strip()
+
+
+@lru_cache(maxsize=1)
+def get_easyocr_reader():
+    """Lazily initialize EasyOCR reader (English only for card glyphs)."""
+    if easyocr is None:
+        raise RuntimeError("EasyOCR is not installed. Install it with: pip install easyocr")
+    return easyocr.Reader(["en"], gpu=False, verbose=False)
+
+
+def ocr_text_with_engine(pil_image: Image.Image, engine: str = "pytesseract", psm: int = 11,
+                         whitelist: str = "") -> str:
+    """Run OCR with selected engine; supports pytesseract and easyocr."""
+    engine = (engine or "pytesseract").lower()
+    if engine == "easyocr":
+        reader = get_easyocr_reader()
+        arr = np.array(pil_image.convert("RGB"))
+        kwargs = {"detail": 0, "paragraph": False}
+        if whitelist:
+            kwargs["allowlist"] = whitelist
+        results = reader.readtext(arr, **kwargs)
+        return " ".join(results).strip()
+
+    config = f"--psm {psm}"
+    if whitelist:
+        config += f" -c tessedit_char_whitelist={whitelist}"
+    return pytesseract.image_to_string(pil_image, config=config).strip()
+
+
+def ocr_single_symbol_with_engine(pil_image: Image.Image, whitelist: str, engine: str = "pytesseract") -> str:
+    """Run OCR on a tight symbol crop with selected engine."""
+    normalized = normalize_symbol_patch(pil_image)
+    if normalized is None:
+        return ""
+    ocr_image = Image.fromarray(255 - normalized)
+    return ocr_text_with_engine(ocr_image, engine=engine, psm=10, whitelist=whitelist)
 
 
 def normalize_rank_symbol(text: str) -> Optional[str]:
@@ -542,7 +583,8 @@ def rotate_for_ocr(pil_image: Image.Image, angle: int) -> Image.Image:
 
 def recognize_card_from_region(card_image: Image.Image, orientations: list = None, 
                                  rank_threshold: float = 0.35, suit_threshold: float = 0.25,
-                                 red_ratio_threshold: float = 0.38, manual_rotation: int = 0) -> Tuple[Optional[str], float, str]:
+                                 red_ratio_threshold: float = 0.38, manual_rotation: int = 0,
+                                 ocr_engine: str = "pytesseract") -> Tuple[Optional[str], float, str]:
     """Recognize a card from a rectified crop using template matching with OCR fallback."""
     if orientations is None:
         orientations = [0, 180]
@@ -577,7 +619,7 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         print(f"  Saved debug crops to {debug_dir}/ (card_full, rank, suit @ {orientation}°)", file=sys.stderr, flush=True)
 
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
-        rank_ocr = normalize_rank_symbol(ocr_single_symbol(rank_crop, "0123456789TJQKAIO"))
+        rank_ocr = normalize_rank_symbol(ocr_single_symbol_with_engine(rank_crop, "0123456789TJQKAIO", ocr_engine))
         
         # DEBUG decision logic
         import sys
@@ -598,7 +640,7 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
 
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop, red_ratio_threshold) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits, debug_label=f"SUIT@{orientation}° allowed={allowed_suits}")
-        suit_ocr = normalize_suit_symbol(ocr_single_symbol(suit_crop, "CDHScdhs♣♦♥♠"))
+        suit_ocr = normalize_suit_symbol(ocr_single_symbol_with_engine(suit_crop, "CDHScdhs♣♦♥♠", ocr_engine))
         
         # Choose best suit: prefer template match over OCR generally
         if suit_match and suit_ocr and suit_match == suit_ocr and suit_match in allowed_suits:
@@ -645,7 +687,8 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
                              hole_rotation: int = 0, board_rotation: int = 0,
                              card1_rotation: int = 0, card2_rotation: int = 0,
                              hsv_v_min: int = 95, hsv_v_max: int = 255,
-                             hsv_s_max: int = 75) -> Tuple[List[str], List[str], List[int]]:
+                             hsv_s_max: int = 75,
+                             ocr_engine: str = "pytesseract") -> Tuple[List[str], List[str], List[int]]:
     """Detect cards from likely card regions using template matching and region-local OCR. Returns (cards, debug_lines, angles)."""
     if orientations is None:
         orientations = [0, 180]
@@ -699,7 +742,7 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
             split_debug = []
             for side_name, side_img, side_shift in (("L", left_crop, -18), ("R", right_crop, 18)):
                 side_card, side_score, side_info = recognize_card_from_region(
-                    side_img, orientations, rank_threshold, suit_threshold, red_ratio_threshold, split_rotation
+                    side_img, orientations, rank_threshold, suit_threshold, red_ratio_threshold, split_rotation, ocr_engine
                 )
                 # Split results are noisy; require stronger confidence than normal regions.
                 if side_card and side_score >= 1.20:
@@ -711,7 +754,7 @@ def detect_cards_by_regions(pil_image: Image.Image, orientations: list = None,
                 debug_lines.append(f"region {index} @ {center}: split hole-card blob -> {' | '.join(split_debug)}")
                 continue
 
-        card, score, debug = recognize_card_from_region(card_image, orientations, rank_threshold, suit_threshold, red_ratio_threshold, manual_rotation)
+        card, score, debug = recognize_card_from_region(card_image, orientations, rank_threshold, suit_threshold, red_ratio_threshold, manual_rotation, ocr_engine)
         if not card:
             debug_lines.append(f"region {index} @ {center}: no card match")
             continue
@@ -740,7 +783,8 @@ def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None,
                           hole_rotation: int = 0, board_rotation: int = 0,
                           card1_rotation: int = 0, card2_rotation: int = 0,
                           hsv_v_min: int = 95, hsv_v_max: int = 255,
-                         hsv_s_max: int = 75) -> Tuple[str, List[str], List[int]]:
+                         hsv_s_max: int = 75,
+                         ocr_engine: str = "pytesseract") -> Tuple[str, List[str], List[int]]:
     """Use region detection first, then multi-angle OCR as a fallback and supplement. Returns (raw_text, cards, angles)."""
     if rotation_angles is None:
         rotation_angles = [-5, 0, 5]
@@ -751,7 +795,7 @@ def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None,
                                                           white_ratio_threshold, aspect_ratio_min, aspect_ratio_max,
                                                           fill_ratio_threshold, red_ratio_threshold,
                                                           hole_rotation, board_rotation, card1_rotation, card2_rotation,
-                                                          hsv_v_min, hsv_v_max, hsv_s_max)
+                                                          hsv_v_min, hsv_v_max, hsv_s_max, ocr_engine)
     all_cards = list(region_cards)
     all_angles = list(region_angles)
     
@@ -771,7 +815,7 @@ def ocr_cards_from_image(pil_image: Image.Image, rotation_angles: list = None,
     for angle in rotation_angles:
         rotated = rotate_for_ocr(pil_image, angle)
         processed = preprocess_for_ocr(rotated, upscale_factor)
-        text = pytesseract.image_to_string(processed, config=OCR_CONFIG)
+        text = ocr_text_with_engine(processed, engine=ocr_engine, psm=11)
         # DEBUG: Show what OCR actually read
         import sys
         print(f"  [FULL-OCR@{angle}°] Raw text: {text.strip()!r}", file=sys.stderr, flush=True)
@@ -837,6 +881,8 @@ def capture_and_ocr(rotation_angles: list = None, orientations: list = None,
                     card1_rotation: int = 0, card2_rotation: int = 0,
                     hsv_v_min: int = 95, hsv_v_max: int = 255,
                     hsv_s_max: int = 75,
+                    ocr_engine: str = "pytesseract",
+                    auto_expand_bbox: bool = False,
                     bbox: tuple = None) -> Tuple[str, List[str], List[int]]:
     """Capture screen region (or full screen), OCR multiple tilt angles, and return the best text plus merged cards."""
     import sys
@@ -847,24 +893,32 @@ def capture_and_ocr(rotation_angles: list = None, orientations: list = None,
     print(f"[CAPTURE] full screenshot size={screenshot.size}", file=sys.stderr, flush=True)
     
     if bbox:
-        # Expand selection to account for partially visible/fanned hole cards.
-        # Hole cards are often clipped at the lower edge of the manually selected area.
         x1, y1, x2, y2 = bbox
-        w = max(1, x2 - x1)
-        h = max(1, y2 - y1)
-        expand_x = int(w * 0.12)
-        expand_up = int(h * 0.08)
-        expand_down = int(h * 0.45)
-
         sx, sy = screenshot.size
-        x1 = max(0, x1 - expand_x)
-        x2 = min(sx, x2 + expand_x)
-        y1 = max(0, y1 - expand_up)
-        y2 = min(sy, y2 + expand_down)
-        adjusted_bbox = (x1, y1, x2, y2)
-        print(f"[CAPTURE] adjusted bbox={adjusted_bbox}", file=sys.stderr, flush=True)
 
-        # Crop to adjusted region (bbox is in native/Retina coordinates)
+        if auto_expand_bbox:
+            # Optional expansion for partially visible/fanned hole cards.
+            w = max(1, x2 - x1)
+            h = max(1, y2 - y1)
+            expand_x = int(w * 0.12)
+            expand_up = int(h * 0.08)
+            expand_down = int(h * 0.45)
+            x1 = max(0, x1 - expand_x)
+            x2 = min(sx, x2 + expand_x)
+            y1 = max(0, y1 - expand_up)
+            y2 = min(sy, y2 + expand_down)
+            adjusted_bbox = (x1, y1, x2, y2)
+            print(f"[CAPTURE] adjusted bbox={adjusted_bbox}", file=sys.stderr, flush=True)
+        else:
+            adjusted_bbox = (
+                max(0, min(sx, int(x1))),
+                max(0, min(sy, int(y1))),
+                max(0, min(sx, int(x2))),
+                max(0, min(sy, int(y2))),
+            )
+            print(f"[CAPTURE] strict bbox={adjusted_bbox}", file=sys.stderr, flush=True)
+
+        # Crop to adjusted/strict region (bbox is in native/Retina coordinates)
         screenshot = screenshot.crop(adjusted_bbox)
         print(f"[CAPTURE] cropped to bbox, new size={screenshot.size}", file=sys.stderr, flush=True)
     
@@ -873,8 +927,7 @@ def capture_and_ocr(rotation_angles: list = None, orientations: list = None,
                                  rank_threshold, suit_threshold, white_ratio_threshold,
                                  aspect_ratio_min, aspect_ratio_max, fill_ratio_threshold, red_ratio_threshold,
                                  hole_rotation, board_rotation, card1_rotation, card2_rotation,
-                                 hsv_v_min, hsv_v_max, hsv_s_max)
-
+                                 hsv_v_min, hsv_v_max, hsv_s_max, ocr_engine)
 
 # ──────────────────────────────────────────────
 # Poker hand evaluator (pure Python, no external lib)
@@ -1184,6 +1237,8 @@ class PokerGeniusApp(tk.Tk):
         self.ocr_rotation_angles = [-5, 0, 5]
         self.ocr_angle_step = 5
         self.ocr_orientations = [0, 180]
+        self.ocr_engine = "pytesseract"
+        self.auto_expand_bbox = False  # Respect selected board area strictly by default
         self.ocr_rank_threshold = 0.60  # Balanced OCR/template blending
         self.ocr_suit_threshold = 0.20  # Slightly stricter than rank for symbol stability
         self.ocr_upscale_factor = 2
@@ -1459,13 +1514,40 @@ class PokerGeniusApp(tk.Tk):
                    bg=self.BG2, fg=F, insertbackground=F).pack(side=tk.LEFT, padx=2)
         tk.Label(upscale_frame, text="×  (higher = slower but more accurate)", 
                  bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
+
+        # OCR engine selection
+        engine_frame = tk.Frame(content, bg=B)
+        engine_frame.grid(row=11, column=0, sticky=tk.W, pady=(0,12))
+        tk.Label(engine_frame, text="OCR engine:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,6))
+        ocr_engine_var = tk.StringVar(value=self.ocr_engine)
+        engine_menu = tk.OptionMenu(engine_frame, ocr_engine_var, *OCR_ENGINES)
+        engine_menu.config(bg=self.BG2, fg=F, activebackground=B,
+                  font=("Helvetica", 10), relief=tk.FLAT, highlightthickness=0)
+        engine_menu["menu"].config(bg=self.BG2, fg=F, font=("Helvetica", 10))
+        engine_menu.pack(side=tk.LEFT)
+        tk.Label(engine_frame, text="(easyocr may be slower but can read stylized glyphs better)",
+             bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=8)
+
+        expand_frame = tk.Frame(content, bg=B)
+        expand_frame.grid(row=12, column=0, sticky=tk.W, pady=(0,10))
+        auto_expand_var = tk.BooleanVar(value=self.auto_expand_bbox)
+        tk.Checkbutton(
+            expand_frame,
+            text="Auto-expand board area (helps partial hole cards)",
+            variable=auto_expand_var,
+            bg=B,
+            fg=F,
+            selectcolor=self.BG2,
+            activebackground=B,
+            activeforeground=F,
+        ).pack(anchor=tk.W)
         
         # White ratio threshold
         tk.Label(content, text="Card Detection:", 
-                 bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=11, column=0, sticky=tk.W, pady=(8,4))
+             bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=13, column=0, sticky=tk.W, pady=(8,4))
         
         white_ratio_frame = tk.Frame(content, bg=B)
-        white_ratio_frame.grid(row=12, column=0, sticky=tk.W, pady=(0,16))
+        white_ratio_frame.grid(row=14, column=0, sticky=tk.W, pady=(0,16))
         
         tk.Label(white_ratio_frame, text="White ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         white_ratio_var = tk.DoubleVar(value=self.white_ratio_threshold)
@@ -1477,7 +1559,7 @@ class PokerGeniusApp(tk.Tk):
         
         # Aspect ratio thresholds
         aspect_frame = tk.Frame(content, bg=B)
-        aspect_frame.grid(row=13, column=0, sticky=tk.W, pady=(0,8))
+        aspect_frame.grid(row=15, column=0, sticky=tk.W, pady=(0,8))
         
         tk.Label(aspect_frame, text="Aspect ratio:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         aspect_min_var = tk.DoubleVar(value=self.aspect_ratio_min)
@@ -1494,7 +1576,7 @@ class PokerGeniusApp(tk.Tk):
         
         # Fill ratio threshold
         fill_ratio_frame = tk.Frame(content, bg=B)
-        fill_ratio_frame.grid(row=14, column=0, sticky=tk.W, pady=(0,8))
+        fill_ratio_frame.grid(row=16, column=0, sticky=tk.W, pady=(0,8))
         
         tk.Label(fill_ratio_frame, text="Fill ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         fill_ratio_var = tk.DoubleVar(value=self.fill_ratio_threshold)
@@ -1506,7 +1588,7 @@ class PokerGeniusApp(tk.Tk):
         
         # Red ratio threshold
         red_ratio_frame = tk.Frame(content, bg=B)
-        red_ratio_frame.grid(row=15, column=0, sticky=tk.W, pady=(0,8))
+        red_ratio_frame.grid(row=17, column=0, sticky=tk.W, pady=(0,8))
         
         tk.Label(red_ratio_frame, text="Red ratio threshold:", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         red_ratio_var = tk.DoubleVar(value=self.red_ratio_threshold)
@@ -1518,7 +1600,7 @@ class PokerGeniusApp(tk.Tk):
         
         # HSV brightness thresholds
         hsv_frame = tk.Frame(content, bg=B)
-        hsv_frame.grid(row=16, column=0, sticky=tk.W, pady=(0,16))
+        hsv_frame.grid(row=18, column=0, sticky=tk.W, pady=(0,16))
         
         tk.Label(hsv_frame, text="HSV brightness (V):", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         hsv_v_min_var = tk.IntVar(value=self.hsv_v_min)
@@ -1534,7 +1616,7 @@ class PokerGeniusApp(tk.Tk):
                  bg=B, fg=self.DIM, font=("Helvetica", 9)).pack(side=tk.LEFT, padx=4)
 
         hsv_sat_frame = tk.Frame(content, bg=B)
-        hsv_sat_frame.grid(row=17, column=0, sticky=tk.W, pady=(0,16))
+        hsv_sat_frame.grid(row=19, column=0, sticky=tk.W, pady=(0,16))
 
         tk.Label(hsv_sat_frame, text="HSV saturation max (S):", bg=B, fg=F).pack(side=tk.LEFT, padx=(0,4))
         hsv_s_max_var = tk.IntVar(value=self.hsv_s_max)
@@ -1546,12 +1628,12 @@ class PokerGeniusApp(tk.Tk):
         
         # Debug Image Previews
         tk.Label(content, text="Debug Image Previews:", 
-             bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=18, column=0, sticky=tk.W, pady=(8,4))
+            bg=B, fg=F, font=("Helvetica", 11, "bold")).grid(row=20, column=0, sticky=tk.W, pady=(8,4))
         tk.Label(content, text="Recent OCR processing images (check HSV Mask shows white cards, not just balance numbers)", 
-             bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=19, column=0, sticky=tk.W, pady=(0,8))
+            bg=B, fg=self.DIM, font=("Helvetica", 9)).grid(row=21, column=0, sticky=tk.W, pady=(0,8))
         
         preview_frame = tk.Frame(content, bg=B)
-        preview_frame.grid(row=20, column=0, sticky=tk.W, pady=(0,16))
+        preview_frame.grid(row=22, column=0, sticky=tk.W, pady=(0,16))
         
         # Create preview labels (will be populated with images)
         preview_labels = {}
@@ -1633,6 +1715,8 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rank_threshold = rank_thresh_var.get()
             self.ocr_suit_threshold = suit_thresh_var.get()
             self.ocr_upscale_factor = upscale_var.get()
+            self.ocr_engine = ocr_engine_var.get()
+            self.auto_expand_bbox = auto_expand_var.get()
             self.white_ratio_threshold = white_ratio_var.get()
             self.aspect_ratio_min = aspect_min_var.get()
             self.aspect_ratio_max = aspect_max_var.get()
@@ -1642,7 +1726,7 @@ class PokerGeniusApp(tk.Tk):
             self.hsv_v_max = hsv_v_max_var.get()
             self.hsv_s_max = hsv_s_max_var.get()
             
-            self._set_status(f"OCR params: angles={self.ocr_rotation_angles}, orientations={self.ocr_orientations}")
+            self._set_status(f"OCR params: engine={self.ocr_engine}, angles={self.ocr_rotation_angles}, orientations={self.ocr_orientations}")
             self.preview_refresh_callback = None
             canvas.unbind_all("<MouseWheel>")
             win.destroy()
@@ -1651,6 +1735,8 @@ class PokerGeniusApp(tk.Tk):
             self.ocr_rotation_angles = [-5, 0, 5]
             self.ocr_angle_step = 5
             self.ocr_orientations = [0, 180]
+            self.ocr_engine = "pytesseract"
+            self.auto_expand_bbox = False
             self.ocr_rank_threshold = 0.60
             self.ocr_suit_threshold = 0.20
             self.ocr_upscale_factor = 2
@@ -2166,6 +2252,8 @@ class PokerGeniusApp(tk.Tk):
                 self.hsv_v_min,
                 self.hsv_v_max,
                 self.hsv_s_max,
+                self.ocr_engine,
+                self.auto_expand_bbox,
                 self.capture_bbox
             )
             self.detected_card_angles = angles  # Store for display
