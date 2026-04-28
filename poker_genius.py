@@ -1408,12 +1408,46 @@ class PokerGeniusApp(tk.Tk):
         self.card1_rotation = 0  # Individual rotation for first hole card
         self.card2_rotation = 0  # Individual rotation for second hole card
 
-        # ── Buttons ────────────────────────────────
-        bf = tk.Frame(self, bg=B)
-        bf.pack(pady=6)
+        # ── Buttons (horizontally scrollable belt) ────
+        belt_outer = tk.Frame(self, bg=B)
+        belt_outer.pack(fill=tk.X, padx=8, pady=6)
+
+        belt_canvas = tk.Canvas(belt_outer, bg=B, height=46,
+                                highlightthickness=0, bd=0)
+        belt_hsb = tk.Scrollbar(belt_outer, orient=tk.HORIZONTAL,
+                                command=belt_canvas.xview)
+        belt_canvas.configure(xscrollcommand=belt_hsb.set)
+
+        belt_hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        belt_canvas.pack(side=tk.TOP, fill=tk.X)
+
+        bf = tk.Frame(belt_canvas, bg=B)
+        _belt_win = belt_canvas.create_window((0, 0), window=bf, anchor=tk.NW)
+
+        def _belt_configure(event):
+            belt_canvas.configure(scrollregion=belt_canvas.bbox("all"))
+            # If content fits, hide scrollbar; show it when it doesn't.
+            if bf.winfo_reqwidth() <= belt_canvas.winfo_width():
+                belt_hsb.pack_forget()
+            else:
+                belt_hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        bf.bind("<Configure>", _belt_configure)
+
+        # Shift+scroll (macOS) or horizontal scroll wheel -> scroll the belt.
+        def _belt_hscroll(event):
+            if event.delta:
+                belt_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        belt_canvas.bind("<Shift-MouseWheel>", _belt_hscroll)
+        belt_canvas.bind("<MouseWheel>", _belt_hscroll)
+        bf.bind("<Shift-MouseWheel>", _belt_hscroll)
+
         self.capture_btn = self._btn(bf, "Capture Screen & Analyze", self._on_capture)
         self.capture_btn.pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Analyze Manual Input", self._on_manual).pack(side=tk.LEFT, padx=6)
+        self.ml_btn = self._btn(bf, "Only ML Model Analysis", self._on_ml_only_capture)
+        self.ml_btn.pack(side=tk.LEFT, padx=6)
         self._btn(bf, "Clear", self._on_clear).pack(side=tk.LEFT, padx=6)
         self.board_area_btn = self._btn(bf, "Set Board Area", self._set_board_area)
         self.board_area_btn.pack(side=tk.LEFT, padx=6)
@@ -2431,6 +2465,78 @@ class PokerGeniusApp(tk.Tk):
         self._set_pending_result("Analyzing…", "Waiting for OCR results from the screen capture.")
         self.capture_btn.config(state=tk.DISABLED)
         threading.Thread(target=self._capture_worker, daemon=True).start()
+
+    def _on_ml_only_capture(self):
+        """Capture the board area and classify cards using only the PyTorch models."""
+        if predict_rank_symbol is None or predict_suit_symbol is None:
+            messagebox.showerror(
+                "PyTorch model unavailable",
+                "card_symbol_model could not be loaded.\n"
+                "Run 'Train/Fine-tune Model' first so the .pt files exist.",
+            )
+            return
+        status = model_status() if model_status else {}
+        if not status.get("rank_model") or not status.get("suit_model"):
+            messagebox.showerror(
+                "Models not trained yet",
+                "No saved model files found in models/.\n"
+                "Click 'Train/Fine-tune Model' first.",
+            )
+            return
+        self._set_status("ML-only capture…")
+        self.ocr_text.delete("1.0", tk.END)
+        self.ocr_text.insert(tk.END, "Running ML-only card recognition…\n")
+        self._set_pending_result("Analyzing…", "Running PyTorch symbol classifiers on captured regions.")
+        self.ml_btn.config(state=tk.DISABLED)
+        threading.Thread(target=self._ml_only_worker, daemon=True).start()
+
+    def _ml_only_worker(self):
+        """Background thread: capture regions → PyTorch classifiers → GTO analysis."""
+        try:
+            regions = self._capture_regions_for_labeling()
+            if not regions:
+                self.after(0, lambda: self._show_result(
+                    "No regions detected",
+                    "Adjust 'Set Board Area' or OCR Parameters and try again."
+                ))
+                self.after(0, lambda: self._set_status("ML-only: no card regions found."))
+                return
+
+            from card_symbol_model import (
+                extract_rank_and_suit_crops,
+                predict_rank_symbol as _rank_pred,
+                predict_suit_symbol as _suit_pred,
+            )
+
+            cards: List[str] = []
+            detail_lines: List[str] = []
+            for idx, (center, card_img, bbox, angle) in enumerate(regions, start=1):
+                rank_crop, suit_crop = extract_rank_and_suit_crops(card_img)
+                rank, rank_conf = _rank_pred(rank_crop)
+                suit, suit_conf = _suit_pred(suit_crop)
+                line = (
+                    f"region {idx} @ {center}: "
+                    f"rank={rank}({rank_conf:.2f}) suit={suit}({suit_conf:.2f})"
+                )
+                detail_lines.append(line)
+                if rank and suit:
+                    card = rank + suit
+                    if card not in cards:
+                        cards.append(card)
+
+            summary = f"ML cards: {', '.join(cards) if cards else 'none'}"
+            raw = summary + "\n" + "\n".join(detail_lines)
+            self.after(0, lambda: self._display_ocr(raw, cards))
+            self.after(0, lambda: self._run_analysis(cards))
+            self.after(0, lambda: self._set_status(f"ML-only analysis: {summary}"))
+            if self.preview_refresh_callback:
+                self.after(0, self.preview_refresh_callback)
+        except Exception as exc:
+            self.after(0, lambda: self._show_result("ML capture failed", str(exc)))
+            self.after(0, lambda: messagebox.showerror("Error", str(exc)))
+            self.after(0, lambda: self._set_status("ML-only capture error."))
+        finally:
+            self.after(0, lambda: self.ml_btn.config(state=tk.NORMAL))
 
     def _capture_worker(self):
         try:
