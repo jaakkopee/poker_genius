@@ -3,3 +3,4 @@ pytesseract>=0.3.10
 easyocr>=1.7.0
 opencv-python>=4.8.0
 numpy>=1.24.0
+torch>=2.2.0

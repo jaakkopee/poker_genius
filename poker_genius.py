@@ -3,10 +3,12 @@ Poker Genius - Screen capture + OCR + GTO poker advisor
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, simpledialog
 import threading
 import re
 import sys
+import os
+import time
 from functools import lru_cache
 from itertools import combinations
 from typing import Optional, List, Tuple
@@ -19,6 +21,21 @@ except Exception:
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab, ImageTk
 import cv2
 import numpy as np
+
+try:
+    from card_symbol_model import (
+        add_labeled_card_sample,
+        model_status,
+        predict_rank_symbol,
+        predict_suit_symbol,
+        train_rank_and_suit_models,
+    )
+except Exception:
+    add_labeled_card_sample = None
+    model_status = None
+    predict_rank_symbol = None
+    predict_suit_symbol = None
+    train_rank_and_suit_models = None
 
 
 # ──────────────────────────────────────────────
@@ -50,6 +67,8 @@ CARD_ORIENTATIONS = (0, 180)
 TEMPLATE_CONFIDENCE_THRESHOLD = 0.50
 CARD_CANVAS = (180, 252)
 SYMBOL_TEMPLATE_SIZE = (64, 64)
+ML_RANK_CONFIDENCE_THRESHOLD = 0.72
+ML_SUIT_CONFIDENCE_THRESHOLD = 0.72
 # Very permissive HSV mask - accept darker cards (V >= 50 instead of 100)
 CARD_MASK_LOW = np.array([0, 0, 80], dtype=np.uint8)
 CARD_MASK_HIGH = np.array([180, 90, 255], dtype=np.uint8)
@@ -620,19 +639,29 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
 
         rank_match, rank_score = template_match_symbol(rank_crop, get_rank_templates(), debug_label=f"RANK@{orientation}°")
         rank_ocr = normalize_rank_symbol(ocr_single_symbol_with_engine(rank_crop, "0123456789TJQKAIO", ocr_engine))
+        rank_ml, rank_ml_conf = (None, 0.0)
+        if predict_rank_symbol is not None:
+            try:
+                rank_ml, rank_ml_conf = predict_rank_symbol(rank_crop)
+            except Exception:
+                rank_ml, rank_ml_conf = (None, 0.0)
         
         # DEBUG decision logic
         import sys
         print(f"  [DECISION] rank_match={rank_match!r} rank_score={rank_score} rank_ocr={rank_ocr!r}", file=sys.stderr, flush=True)
         print(f"  [DECISION] score<=0.40? {rank_score <= 0.40}, both_exist? {bool(rank_ocr and rank_match)}", file=sys.stderr, flush=True)
         
-        # Choose best rank: require very high template confidence to override OCR
-        if rank_match and rank_ocr and rank_match == rank_ocr:
+        # Choose best rank from template + OCR + ML.
+        if rank_ml and rank_ml_conf >= ML_RANK_CONFIDENCE_THRESHOLD:
+            rank = rank_ml
+        elif rank_match and rank_ocr and rank_match == rank_ocr:
             rank = rank_match  # Both agree - definitely correct
         elif rank_match and rank_score >= rank_threshold:
             rank = rank_match  # Template is confident enough, trust it
         elif rank_ocr:
             rank = rank_ocr  # OCR has a result - trust it (template not confident enough or disagrees)
+        elif rank_ml and rank_ml_conf >= 0.55:
+            rank = rank_ml  # Medium-confidence ML fallback.
         elif rank_match:
             rank = rank_match  # No OCR, use template
         else:
@@ -641,9 +670,17 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         allowed_suits = RED_SUITS if estimate_red_suit(suit_crop, red_ratio_threshold) else BLACK_SUITS
         suit_match, suit_score = template_match_symbol(suit_crop, get_suit_templates(), allowed_suits, debug_label=f"SUIT@{orientation}° allowed={allowed_suits}")
         suit_ocr = normalize_suit_symbol(ocr_single_symbol_with_engine(suit_crop, "CDHScdhs♣♦♥♠", ocr_engine))
+        suit_ml, suit_ml_conf = (None, 0.0)
+        if predict_suit_symbol is not None:
+            try:
+                suit_ml, suit_ml_conf = predict_suit_symbol(suit_crop)
+            except Exception:
+                suit_ml, suit_ml_conf = (None, 0.0)
         
-        # Choose best suit: prefer template match over OCR generally
-        if suit_match and suit_ocr and suit_match == suit_ocr and suit_match in allowed_suits:
+        # Choose best suit from template + OCR + ML, respecting color gate when possible.
+        if suit_ml and suit_ml_conf >= ML_SUIT_CONFIDENCE_THRESHOLD and suit_ml in allowed_suits:
+            suit = suit_ml
+        elif suit_match and suit_ocr and suit_match == suit_ocr and suit_match in allowed_suits:
             suit = suit_match  # Both agree and in allowed set
         elif suit_match and suit_score >= suit_threshold and suit_match in allowed_suits:
             suit = suit_match  # Template is confident
@@ -651,6 +688,8 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
             suit = suit_match  # Template has some confidence in allowed suit
         elif suit_ocr and suit_ocr in allowed_suits:
             suit = suit_ocr  # OCR result in allowed set
+        elif suit_ml and suit_ml_conf >= 0.55:
+            suit = suit_ml  # Medium-confidence ML fallback.
         elif suit_match:
             suit = suit_match  # Template result even if not in allowed (color detection may be wrong)
         else:
@@ -658,7 +697,12 @@ def recognize_card_from_region(card_image: Image.Image, orientations: list = Non
         
         # Debug output
         import sys
-        print(f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} → {rank} | suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} allowed={allowed_suits} → {suit}", file=sys.stderr, flush=True)
+        print(
+            f"  orient={orientation}° | rank: tpl={rank_match}({rank_score:.3f}) ocr={rank_ocr} ml={rank_ml}({rank_ml_conf:.2f}) → {rank} "
+            f"| suit: tpl={suit_match}({suit_score:.3f}) ocr={suit_ocr} ml={suit_ml}({suit_ml_conf:.2f}) allowed={allowed_suits} → {suit}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if rank and suit:
             # Strongly prefer upright (0°) orientation by penalizing 180°.
@@ -1290,6 +1334,13 @@ class PokerGeniusApp(tk.Tk):
         self.capture_bbox = None
         
         self._build_ui()
+        if model_status is not None:
+            try:
+                st = model_status()
+                if st.get("rank_model") and st.get("suit_model"):
+                    self._set_status("Ready. PyTorch symbol models are available.")
+            except Exception:
+                pass
 
     def _build_ui(self):
         B, F = self.BG, self.FG
@@ -1368,6 +1419,8 @@ class PokerGeniusApp(tk.Tk):
         self.board_area_btn.pack(side=tk.LEFT, padx=6)
         self.card_angles_btn = self._btn(bf, "Set Card Angles", self._set_card_angles)
         self.card_angles_btn.pack(side=tk.LEFT, padx=6)
+        self._btn(bf, "Add Labeled Capture", self._add_labeled_capture).pack(side=tk.LEFT, padx=6)
+        self._btn(bf, "Train/Fine-tune Model", self._train_or_finetune_model).pack(side=tk.LEFT, padx=6)
         self._btn(bf, "OCR Parameters", self._open_ocr_params).pack(side=tk.LEFT, padx=6)
 
         # ── OCR output ─────────────────────────────
@@ -2245,6 +2298,131 @@ class PokerGeniusApp(tk.Tk):
         overlay.bind('r', reset_angles)
         overlay.bind('R', reset_angles)
         overlay.focus_set()
+
+    def _capture_regions_for_labeling(self) -> List[Tuple[Tuple[int, int], Image.Image, Tuple[int, int, int, int], float]]:
+        """Capture current board area and return detected card regions for user labeling."""
+        screenshot = ImageGrab.grab()
+        if self.capture_bbox:
+            x1, y1, x2, y2 = self.capture_bbox
+            sx, sy = screenshot.size
+            adjusted_bbox = (
+                max(0, min(sx, int(x1))),
+                max(0, min(sy, int(y1))),
+                max(0, min(sx, int(x2))),
+                max(0, min(sy, int(y2))),
+            )
+            screenshot = screenshot.crop(adjusted_bbox)
+
+        return find_card_regions(
+            screenshot,
+            self.white_ratio_threshold,
+            self.aspect_ratio_min,
+            self.aspect_ratio_max,
+            self.fill_ratio_threshold,
+            self.hsv_v_min,
+            self.hsv_v_max,
+            self.hsv_s_max,
+        )
+
+    def _add_labeled_capture(self):
+        """Capture card crops and save user-provided labels for future fine-tuning."""
+        if add_labeled_card_sample is None:
+            messagebox.showerror("PyTorch model unavailable", "Could not load card_symbol_model.py or its dependencies.")
+            return
+
+        self._set_status("Capturing card regions for labeling…")
+        try:
+            regions = self._capture_regions_for_labeling()
+        except Exception as exc:
+            messagebox.showerror("Capture failed", str(exc))
+            self._set_status("Labeled capture failed.")
+            return
+
+        if not regions:
+            messagebox.showinfo("No cards found", "No card regions were detected. Try adjusting board area or OCR parameters.")
+            self._set_status("No regions available for labeling.")
+            return
+
+        prompt = (
+            "Enter card labels in visible order (top-left to bottom-right).\n"
+            f"Detected regions: {len(regions)}\n"
+            "Example: Ah Kd 7s 8h Qd"
+        )
+        raw = simpledialog.askstring("Label captured cards", prompt, parent=self)
+        if not raw:
+            self._set_status("Labeling canceled.")
+            return
+
+        labels = parse_cards_from_text(raw)
+        if not labels:
+            messagebox.showerror("Invalid labels", "No valid card labels found in input.")
+            self._set_status("Labeling failed: invalid card labels.")
+            return
+
+        pairs = min(len(labels), len(regions))
+        if pairs < len(regions):
+            proceed = messagebox.askyesno(
+                "Partial labels",
+                f"You entered {len(labels)} labels for {len(regions)} regions. Save first {pairs} pairs?",
+            )
+            if not proceed:
+                self._set_status("Labeling canceled.")
+                return
+
+        saved = 0
+        for idx in range(pairs):
+            _, card_image, _, _ = regions[idx]
+            card = labels[idx]
+            tag = f"manual_{idx + 1}_{int(time.time())}"
+            add_labeled_card_sample(card_image, card, source_tag=tag)
+            saved += 1
+
+        self._set_status(f"Saved {saved} labeled samples for fine-tuning.")
+        messagebox.showinfo("Samples saved", f"Saved {saved} labeled samples to training_data/user_labeled.")
+
+    def _train_or_finetune_model(self):
+        """Train or fine-tune rank/suit classifiers using bootstrap + user-labeled samples."""
+        if train_rank_and_suit_models is None:
+            messagebox.showerror("PyTorch model unavailable", "Could not load card_symbol_model.py or its dependencies.")
+            return
+
+        self._set_status("Training symbol models…")
+        self._set_pending_result("Training models…", "Training rank/suit classifiers in background.")
+
+        progress_lines: List[str] = []
+
+        def progress(msg: str):
+            progress_lines.append(msg)
+            if len(progress_lines) % 2 == 0:
+                self.after(0, lambda m=msg: self._set_status(f"Training models… {m}"))
+
+        def worker():
+            try:
+                results = train_rank_and_suit_models(
+                    include_user_data=True,
+                    bootstrap_if_missing=True,
+                    epochs=8,
+                    lr=1e-3,
+                    batch_size=64,
+                    progress=progress,
+                )
+
+                rank_res = results["rank"]
+                suit_res = results["suit"]
+                status = model_status() if model_status else {}
+
+                summary = (
+                    f"Rank model: {rank_res.samples} samples, loss={rank_res.final_loss:.4f}\n"
+                    f"Suit model: {suit_res.samples} samples, loss={suit_res.final_loss:.4f}\n"
+                    f"Models ready: rank={status.get('rank_model', False)} suit={status.get('suit_model', False)}"
+                )
+                self.after(0, lambda: self._show_result("Model training complete", summary))
+                self.after(0, lambda: self._set_status("Model training complete."))
+            except Exception as exc:
+                self.after(0, lambda: self._show_result("Model training failed", str(exc)))
+                self.after(0, lambda: self._set_status("Model training failed."))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_capture(self):
         self._set_status("Capturing screen…")
