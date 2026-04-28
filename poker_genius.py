@@ -1332,6 +1332,7 @@ class PokerGeniusApp(tk.Tk):
         
         # Screen capture region (None = full screen)
         self.capture_bbox = None
+        self.user_data_boost = 6
         
         self._build_ui()
         if model_status is not None:
@@ -2420,6 +2421,74 @@ class PokerGeniusApp(tk.Tk):
             messagebox.showerror("PyTorch model unavailable", "Could not load card_symbol_model.py or its dependencies.")
             return
 
+        win = tk.Toplevel(self)
+        win.title("Model Training Settings")
+        win.geometry("460x240")
+        win.configure(bg=self.BG)
+        win.transient(self)
+        win.grab_set()
+
+        boost_var = tk.IntVar(value=self.user_data_boost)
+
+        tk.Label(
+            win,
+            text="User-labeled Data Emphasis",
+            bg=self.BG,
+            fg=self.ACC,
+            font=("Helvetica", 13, "bold"),
+        ).pack(pady=(14, 8))
+
+        tk.Label(
+            win,
+            text="Higher values make user-labeled samples count more during training.",
+            bg=self.BG,
+            fg=self.FG,
+            font=("Helvetica", 10),
+        ).pack(pady=(0, 8))
+
+        value_label = tk.Label(
+            win,
+            text=f"Boost: x{boost_var.get()}",
+            bg=self.BG,
+            fg=self.GRN,
+            font=("Helvetica", 12, "bold"),
+        )
+        value_label.pack(pady=(0, 6))
+
+        boost_scale = tk.Scale(
+            win,
+            from_=1,
+            to=12,
+            orient=tk.HORIZONTAL,
+            variable=boost_var,
+            bg=self.BG,
+            fg=self.FG,
+            troughcolor=self.BG2,
+            highlightthickness=0,
+            length=320,
+            showvalue=False,
+        )
+        boost_scale.pack(pady=(0, 10))
+
+        def _update_boost_label(*_):
+            value_label.config(text=f"Boost: x{boost_var.get()}")
+
+        boost_var.trace_add("write", _update_boost_label)
+
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.pack(pady=(6, 10))
+
+        def _start_training_from_dialog():
+            self.user_data_boost = max(1, int(boost_var.get()))
+            win.destroy()
+            self._start_train_or_finetune_worker(self.user_data_boost)
+
+        self._btn(btn_row, "Start Training", _start_training_from_dialog).pack(side=tk.LEFT, padx=8)
+        self._btn(btn_row, "Cancel", win.destroy).pack(side=tk.LEFT, padx=8)
+
+    def _start_train_or_finetune_worker(self, user_data_boost: int):
+        """Run model training in background with selected user-data emphasis."""
+
         self._set_status("Training symbol models…")
         self._set_pending_result("Training models…", "Training rank/suit classifiers in background.")
 
@@ -2435,7 +2504,7 @@ class PokerGeniusApp(tk.Tk):
                 results = train_rank_and_suit_models(
                     include_user_data=True,
                     bootstrap_if_missing=True,
-                    user_data_boost=6,
+                    user_data_boost=user_data_boost,
                     epochs=8,
                     lr=1e-3,
                     batch_size=64,
@@ -2447,7 +2516,7 @@ class PokerGeniusApp(tk.Tk):
                 status = model_status() if model_status else {}
 
                 summary = (
-                    "User-labeled data emphasis: boost x6 per sample\n"
+                    f"User-labeled data emphasis: boost x{user_data_boost} per sample\n"
                     f"Rank model: {rank_res.samples} samples, loss={rank_res.final_loss:.4f}\n"
                     f"Suit model: {suit_res.samples} samples, loss={suit_res.final_loss:.4f}\n"
                     f"Models ready: rank={status.get('rank_model', False)} suit={status.get('suit_model', False)}"
