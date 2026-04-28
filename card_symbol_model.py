@@ -78,11 +78,15 @@ class SymbolCNN(nn.Module):
 class SymbolDataset(Dataset):
     """Directory dataset where classes are subfolders and files are PNG/JPG."""
 
-    def __init__(self, folders: List[Path], classes: List[str]):
+    def __init__(self, folders: List[Path], classes: List[str], folder_repeats: Optional[List[int]] = None):
         self.classes = classes
         self.class_to_index = {name: idx for idx, name in enumerate(classes)}
         self.samples: List[Tuple[Path, int]] = []
-        for root in folders:
+        repeats = folder_repeats or [1] * len(folders)
+        if len(repeats) != len(folders):
+            raise ValueError("folder_repeats length must match folders length")
+
+        for root, repeat in zip(folders, repeats):
             if not root.exists():
                 continue
             for class_name in classes:
@@ -91,7 +95,8 @@ class SymbolDataset(Dataset):
                     continue
                 for path in sorted(class_dir.glob("*")):
                     if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
-                        self.samples.append((path, self.class_to_index[class_name]))
+                        for _ in range(max(1, int(repeat))):
+                            self.samples.append((path, self.class_to_index[class_name]))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -338,6 +343,7 @@ def _train_model(
 def train_rank_and_suit_models(
     include_user_data: bool = True,
     bootstrap_if_missing: bool = True,
+    user_data_boost: int = 4,
     epochs: int = 8,
     lr: float = 1e-3,
     batch_size: int = 64,
@@ -349,15 +355,31 @@ def train_rank_and_suit_models(
 
     rank_dirs = [BOOTSTRAP_DIR / "rank"]
     suit_dirs = [BOOTSTRAP_DIR / "suit"]
+    rank_repeats = [1]
+    suit_repeats = [1]
     if include_user_data:
         rank_dirs.append(USER_LABELS_DIR / "rank")
         suit_dirs.append(USER_LABELS_DIR / "suit")
+        rank_repeats.append(max(1, int(user_data_boost)))
+        suit_repeats.append(max(1, int(user_data_boost)))
 
-    rank_set = SymbolDataset(rank_dirs, RANK_CLASSES)
-    suit_set = SymbolDataset(suit_dirs, SUIT_CLASSES)
+    rank_set = SymbolDataset(rank_dirs, RANK_CLASSES, folder_repeats=rank_repeats)
+    suit_set = SymbolDataset(suit_dirs, SUIT_CLASSES, folder_repeats=suit_repeats)
+
+    user_rank_raw = SymbolDataset([USER_LABELS_DIR / "rank"], RANK_CLASSES) if include_user_data else None
+    user_suit_raw = SymbolDataset([USER_LABELS_DIR / "suit"], SUIT_CLASSES) if include_user_data else None
 
     if progress:
-        progress(f"rank samples: {len(rank_set)}, suit samples: {len(suit_set)}")
+        progress(
+            "rank samples: "
+            f"effective={len(rank_set)} raw_user={len(user_rank_raw) if user_rank_raw else 0} "
+            f"(user boost x{max(1, int(user_data_boost))})"
+        )
+        progress(
+            "suit samples: "
+            f"effective={len(suit_set)} raw_user={len(user_suit_raw) if user_suit_raw else 0} "
+            f"(user boost x{max(1, int(user_data_boost))})"
+        )
 
     rank_res = _train_model(rank_set, RANK_CLASSES, RANK_MODEL_PATH, epochs, lr, batch_size, progress)
     suit_res = _train_model(suit_set, SUIT_CLASSES, SUIT_MODEL_PATH, epochs, lr, batch_size, progress)

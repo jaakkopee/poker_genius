@@ -2435,6 +2435,7 @@ class PokerGeniusApp(tk.Tk):
                 results = train_rank_and_suit_models(
                     include_user_data=True,
                     bootstrap_if_missing=True,
+                    user_data_boost=6,
                     epochs=8,
                     lr=1e-3,
                     batch_size=64,
@@ -2446,6 +2447,7 @@ class PokerGeniusApp(tk.Tk):
                 status = model_status() if model_status else {}
 
                 summary = (
+                    "User-labeled data emphasis: boost x6 per sample\n"
                     f"Rank model: {rank_res.samples} samples, loss={rank_res.final_loss:.4f}\n"
                     f"Suit model: {suit_res.samples} samples, loss={suit_res.final_loss:.4f}\n"
                     f"Models ready: rank={status.get('rank_model', False)} suit={status.get('suit_model', False)}"

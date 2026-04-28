@@ -11,6 +11,7 @@ def main() -> None:
     results = train_rank_and_suit_models(
         include_user_data=True,
         bootstrap_if_missing=True,
+        user_data_boost=6,
         epochs=10,
         lr=1e-3,
         batch_size=64,
